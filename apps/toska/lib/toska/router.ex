@@ -11,11 +11,48 @@ defmodule Toska.Router do
   alias Toska.ConfigManager
   alias Toska.RateLimiter
 
+  # Default max body size: 10MB. Can be overridden via TOSKA_MAX_BODY_SIZE env var
+  # or max_body_size config key.
+  @default_max_body_size 10_485_760
+
   plug Plug.Logger
-  plug Plug.Parsers, parsers: [:json], pass: ["application/json"], json_decoder: Jason
+  plug :check_content_length
+  plug Plug.Parsers,
+    parsers: [:json],
+    pass: ["application/json"],
+    json_decoder: Jason,
+    length: @default_max_body_size
   plug :ensure_kv_access
   plug :match
   plug :dispatch
+
+  # Check Content-Length header against configured max body size
+  defp check_content_length(conn, _opts) do
+    max_size = ConfigManager.cached_max_body_size()
+    content_length = get_content_length(conn)
+
+    if content_length != nil and content_length > max_size do
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(413, Jason.encode!(%{error: "Request body too large", max_bytes: max_size}))
+      |> halt()
+    else
+      conn
+    end
+  end
+
+  defp get_content_length(conn) do
+    case Plug.Conn.get_req_header(conn, "content-length") do
+      [length_str | _] ->
+        case Integer.parse(length_str) do
+          {length, ""} -> length
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
 
   # GET / - Welcome page showing server status
   get "/" do
@@ -107,6 +144,36 @@ defmodule Toska.Router do
         conn
         |> put_resp_content_type("application/json")
         |> send_resp(503, Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)}))
+    end
+  end
+
+  # GET /metrics - Prometheus format metrics
+  get "/metrics" do
+    case build_prometheus_metrics() do
+      {:ok, metrics} ->
+        conn
+        |> put_resp_content_type("text/plain; version=0.0.4; charset=utf-8")
+        |> send_resp(200, metrics)
+
+      {:error, _reason} ->
+        conn
+        |> put_resp_content_type("text/plain")
+        |> send_resp(503, "# Metrics unavailable\n")
+    end
+  end
+
+  # POST /admin/reload - Reload configuration
+  post "/admin/reload" do
+    case ConfigManager.reload() do
+      :ok ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{ok: true, message: "Configuration reloaded"}))
+
+      {:error, reason} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(500, Jason.encode!(%{error: "Reload failed", reason: inspect(reason)}))
     end
   end
 
@@ -224,21 +291,27 @@ defmodule Toska.Router do
     end
   end
 
-  # GET /kv/keys - list keys (optional prefix/limit)
+  # GET /kv/keys - list keys with cursor-based pagination
   get "/kv/keys" do
     prefix = conn.params["prefix"] || ""
     limit = parse_int(conn.params["limit"], 100)
+    cursor = conn.params["cursor"]
 
-    case Toska.KVStore.list_keys(prefix, limit) do
-      {:ok, keys} ->
+    case Toska.KVStore.list_keys_cursor(prefix, limit, cursor) do
+      {:ok, result} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(200, Jason.encode!(%{keys: keys}))
+        |> send_resp(200, Jason.encode!(result))
 
-      {:error, :invalid_prefix} ->
+      {:error, :invalid_cursor} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(400, Jason.encode!(%{error: "Invalid prefix"}))
+        |> send_resp(400, Jason.encode!(%{error: "Invalid cursor"}))
+
+      {:error, :invalid_args} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(400, Jason.encode!(%{error: "Invalid arguments"}))
 
       {:error, reason} ->
         conn
@@ -524,5 +597,79 @@ defmodule Toska.Router do
       {_, _, _, _, _, _, _, _} = ip -> to_string(:inet.ntoa(ip))
       _ -> "unknown"
     end
+  end
+
+  defp build_prometheus_metrics do
+    with {:ok, stats} <- Toska.KVStore.stats() do
+      server_status = Toska.Server.status()
+      uptime_seconds = (server_status.uptime || 0) / 1000
+      env = server_status[:config][:env] || "unknown"
+
+      base_metrics = """
+      # HELP toska_keys_total Total number of keys in the store
+      # TYPE toska_keys_total gauge
+      toska_keys_total #{stats.keys}
+
+      # HELP toska_memory_words ETS memory usage in words
+      # TYPE toska_memory_words gauge
+      toska_memory_words #{stats.memory_words}
+
+      # HELP toska_aof_bytes Current AOF file size in bytes
+      # TYPE toska_aof_bytes gauge
+      toska_aof_bytes #{stats.aof_bytes}
+
+      # HELP toska_snapshot_bytes Current snapshot file size in bytes
+      # TYPE toska_snapshot_bytes gauge
+      toska_snapshot_bytes #{stats.snapshot_bytes}
+
+      # HELP toska_uptime_seconds Server uptime in seconds
+      # TYPE toska_uptime_seconds counter
+      toska_uptime_seconds #{uptime_seconds}
+
+      # HELP toska_server_info Server information
+      # TYPE toska_server_info gauge
+      toska_server_info{version="#{Toska.version()}",env="#{env}"} 1
+
+      # HELP toska_last_snapshot_timestamp_seconds Unix timestamp of last snapshot
+      # TYPE toska_last_snapshot_timestamp_seconds gauge
+      toska_last_snapshot_timestamp_seconds #{(stats.last_snapshot_at || 0) / 1000}
+
+      # HELP toska_last_sync_timestamp_seconds Unix timestamp of last AOF sync
+      # TYPE toska_last_sync_timestamp_seconds gauge
+      toska_last_sync_timestamp_seconds #{(stats.last_sync_at || 0) / 1000}
+      """
+
+      # Add replication metrics if in follower mode
+      metrics =
+        case Toska.Replication.Follower.status() do
+          {:ok, follower} ->
+            lag = replication_lag(follower.last_poll_at)
+
+            base_metrics <>
+              """
+
+              # HELP toska_replication_offset Current replication offset
+              # TYPE toska_replication_offset gauge
+              toska_replication_offset #{follower.offset}
+
+              # HELP toska_replication_lag_seconds Time since last poll
+              # TYPE toska_replication_lag_seconds gauge
+              toska_replication_lag_seconds #{lag}
+              """
+
+          _ ->
+            base_metrics
+        end
+
+      {:ok, metrics}
+    else
+      _ -> {:error, :unavailable}
+    end
+  end
+
+  defp replication_lag(nil), do: -1
+
+  defp replication_lag(last_poll_at) do
+    (System.system_time(:millisecond) - last_poll_at) / 1000
   end
 end

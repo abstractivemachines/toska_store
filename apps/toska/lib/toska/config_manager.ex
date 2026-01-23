@@ -16,7 +16,7 @@ defmodule Toska.ConfigManager do
   @config_file "toska_config.json"
 
   # Keys cached in persistent_term for hot-path access (avoid GenServer calls per request)
-  @cached_keys ["auth_token", "replication_auth_token", "rate_limit_per_sec", "rate_limit_burst", "replica_url"]
+  @cached_keys ["auth_token", "replication_auth_token", "rate_limit_per_sec", "rate_limit_burst", "replica_url", "max_body_size"]
   @default_sync_interval_ms 1000
   @default_snapshot_interval_ms 60_000
   @default_ttl_check_interval_ms 1000
@@ -75,6 +75,16 @@ defmodule Toska.ConfigManager do
   """
   def reset_all do
     GenServer.call(@name, :reset_all)
+  end
+
+  @doc """
+  Reload configuration from disk.
+
+  Re-reads the configuration file and updates the in-memory cache.
+  Changes take effect immediately for new requests.
+  """
+  def reload do
+    GenServer.call(@name, :reload)
   end
 
   @doc """
@@ -167,6 +177,59 @@ defmodule Toska.ConfigManager do
 
       _url ->
         true
+    end
+  end
+
+  @doc """
+  Get the cached max body size for HTTP requests.
+  Environment variable TOSKA_MAX_BODY_SIZE takes precedence.
+  Default: 10MB (10_485_760 bytes)
+  """
+  def cached_max_body_size do
+    case System.get_env("TOSKA_MAX_BODY_SIZE") do
+      nil -> :persistent_term.get({__MODULE__, :max_body_size}, 10_485_760)
+      "" -> :persistent_term.get({__MODULE__, :max_body_size}, 10_485_760)
+      val -> parse_int_or_default(val, 10_485_760)
+    end
+  end
+
+  @doc """
+  Get the TLS configuration for the server.
+  Environment variables take precedence over config file.
+  Returns a map with :enabled, :cert_file, :key_file, :ca_cert_file, :verify_client
+  """
+  def tls_config do
+    case GenServer.whereis(@name) do
+      nil ->
+        tls_config_from_env(%{})
+
+      _pid ->
+        case list() do
+          {:ok, config} -> tls_config_from_env(config)
+          _ -> tls_config_from_env(%{})
+        end
+    end
+  end
+
+  defp tls_config_from_env(config) do
+    %{
+      enabled: env_bool("TOSKA_TLS_ENABLED", config["tls_enabled"]),
+      cert_file: System.get_env("TOSKA_TLS_CERT_FILE") || config["tls_cert_file"] || "",
+      key_file: System.get_env("TOSKA_TLS_KEY_FILE") || config["tls_key_file"] || "",
+      ca_cert_file: System.get_env("TOSKA_TLS_CA_CERT_FILE") || config["tls_ca_cert_file"] || "",
+      verify_client: env_bool("TOSKA_TLS_VERIFY_CLIENT", config["tls_verify_client"])
+    }
+  end
+
+  defp env_bool(key, config_value) do
+    case System.get_env(key) do
+      "true" -> true
+      "1" -> true
+      "false" -> false
+      "0" -> false
+      nil -> config_value == true
+      "" -> config_value == true
+      _ -> false
     end
   end
 
@@ -282,6 +345,14 @@ defmodule Toska.ConfigManager do
     end
   end
 
+  @impl true
+  def handle_call(:reload, _from, state) do
+    new_config = load_config(state.file_path)
+    update_cache(new_config)
+    Logger.info("Configuration reloaded from #{state.file_path}")
+    {:reply, :ok, %{state | config: new_config}}
+  end
+
   # Private Functions
 
   defp update_cache(config) do
@@ -291,6 +362,7 @@ defmodule Toska.ConfigManager do
     :persistent_term.put({__MODULE__, :rate_limit_per_sec}, parse_int_or_default(config["rate_limit_per_sec"], 0))
     :persistent_term.put({__MODULE__, :rate_limit_burst}, parse_int_or_default(config["rate_limit_burst"], 0))
     :persistent_term.put({__MODULE__, :replica_url}, config["replica_url"] || "")
+    :persistent_term.put({__MODULE__, :max_body_size}, parse_int_or_default(config["max_body_size"], 10_485_760))
   end
 
   defp load_config(file_path) do
@@ -513,7 +585,15 @@ defmodule Toska.ConfigManager do
       "auth_token" => "",
       "replication_auth_token" => "",
       "rate_limit_per_sec" => 0,
-      "rate_limit_burst" => 0
+      "rate_limit_burst" => 0,
+      # TLS configuration
+      "tls_enabled" => false,
+      "tls_cert_file" => "",
+      "tls_key_file" => "",
+      "tls_ca_cert_file" => "",
+      "tls_verify_client" => false,
+      # Request limits
+      "max_body_size" => 10_485_760
     }
   end
 end

@@ -157,6 +157,89 @@ defmodule Toska.KVStoreTest do
     refute "soon" in keys
   end
 
+  describe "list_keys_cursor/3" do
+    test "returns keys with next_cursor when more results exist" do
+      for i <- 1..25 do
+        key = "page:#{String.pad_leading(to_string(i), 2, "0")}"
+        :ok = Toska.KVStore.put(key, to_string(i))
+      end
+
+      {:ok, page1} = Toska.KVStore.list_keys_cursor("page:", 10, nil)
+      assert length(page1.keys) == 10
+      assert page1.next_cursor != nil
+    end
+
+    test "paginates through all results correctly" do
+      for i <- 1..25 do
+        key = "cursor:#{String.pad_leading(to_string(i), 2, "0")}"
+        :ok = Toska.KVStore.put(key, to_string(i))
+      end
+
+      {:ok, page1} = Toska.KVStore.list_keys_cursor("cursor:", 10, nil)
+      assert length(page1.keys) == 10
+      assert page1.next_cursor != nil
+
+      {:ok, page2} = Toska.KVStore.list_keys_cursor("cursor:", 10, page1.next_cursor)
+      assert length(page2.keys) == 10
+      assert page2.next_cursor != nil
+
+      # No overlap between pages
+      assert MapSet.disjoint?(MapSet.new(page1.keys), MapSet.new(page2.keys))
+
+      {:ok, page3} = Toska.KVStore.list_keys_cursor("cursor:", 10, page2.next_cursor)
+      assert length(page3.keys) == 5
+      assert page3.next_cursor == nil
+
+      # All keys collected
+      all_keys = page1.keys ++ page2.keys ++ page3.keys
+      assert length(all_keys) == 25
+      assert length(Enum.uniq(all_keys)) == 25
+    end
+
+    test "returns nil next_cursor when no more results" do
+      :ok = Toska.KVStore.put("final:1", "v")
+      :ok = Toska.KVStore.put("final:2", "v")
+
+      {:ok, result} = Toska.KVStore.list_keys_cursor("final:", 10, nil)
+      assert length(result.keys) == 2
+      assert result.next_cursor == nil
+    end
+
+    test "returns empty keys and nil cursor when no matches" do
+      {:ok, result} = Toska.KVStore.list_keys_cursor("nonexistent:", 10, nil)
+      assert result.keys == []
+      assert result.next_cursor == nil
+    end
+
+    test "returns error for invalid cursor" do
+      assert {:error, :invalid_cursor} = Toska.KVStore.list_keys_cursor("", 10, "bad!!!")
+    end
+
+    test "returns error for cursor with mismatched prefix" do
+      :ok = Toska.KVStore.put("x:1", "v")
+      cursor = Toska.Cursor.encode("x:1", "x:")
+
+      # Using cursor with different prefix should error
+      assert {:error, :invalid_cursor} = Toska.KVStore.list_keys_cursor("y:", 10, cursor)
+    end
+
+    test "handles limit of 0" do
+      :ok = Toska.KVStore.put("zero:1", "v")
+      {:ok, result} = Toska.KVStore.list_keys_cursor("zero:", 0, nil)
+      assert result.keys == []
+      assert result.next_cursor == nil
+    end
+
+    test "drops expired entries during iteration" do
+      :ok = Toska.KVStore.put("exp:1", "v", 5)
+      :ok = Toska.KVStore.put("exp:2", "v")
+      :timer.sleep(10)
+
+      {:ok, result} = Toska.KVStore.list_keys_cursor("exp:", 10, nil)
+      assert result.keys == ["exp:2"]
+    end
+  end
+
   test "replace_snapshot validates payload" do
     assert {:error, :invalid_snapshot} = Toska.KVStore.replace_snapshot("nope")
 

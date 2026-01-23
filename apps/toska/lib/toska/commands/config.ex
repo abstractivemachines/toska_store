@@ -31,6 +31,9 @@ defmodule Toska.Commands.Config do
       ["reset" | rest] ->
         handle_reset(rest)
 
+      ["reload" | rest] ->
+        handle_reload(rest)
+
       [] ->
         Command.show_error("Config command requires a subcommand")
         show_help()
@@ -56,6 +59,7 @@ defmodule Toska.Commands.Config do
       set <key> <value>   Set configuration value
       list                List all configuration
       reset [key]         Reset configuration to defaults
+      reload              Reload configuration from disk
 
     Examples:
       toska config get port
@@ -365,5 +369,48 @@ defmodule Toska.Commands.Config do
       toska config reset port
       toska config reset --confirm  # Reset all
     """)
+  end
+
+  defp handle_reload(args) do
+    {options, _remaining, invalid} =
+      Command.parse_options(args, [help: :boolean], h: :help)
+
+    cond do
+      options[:help] ->
+        show_reload_help()
+
+      invalid != [] ->
+        Command.show_error("Invalid options: #{inspect(invalid)}")
+        {:error, :invalid_options}
+
+      true ->
+        do_reload()
+    end
+  end
+
+  defp do_reload do
+    case ConfigManager.reload() do
+      :ok ->
+        Command.show_success("Configuration reloaded")
+        :ok
+
+      {:error, reason} ->
+        Command.show_error("Reload failed: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  defp show_reload_help do
+    IO.puts("""
+    Reload configuration from disk
+
+    Usage:
+      toska config reload
+
+    This reloads the configuration file and updates the in-memory cache.
+    Changes take effect immediately for new requests.
+    """)
+
+    :ok
   end
 end

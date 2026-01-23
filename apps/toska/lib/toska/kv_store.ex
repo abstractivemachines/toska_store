@@ -109,6 +109,64 @@ defmodule Toska.KVStore do
 
   def list_keys(_, _), do: {:error, :invalid_prefix}
 
+  @doc """
+  List keys with cursor-based pagination.
+
+  Returns `{:ok, %{keys: [String.t()], next_cursor: String.t() | nil}}`.
+
+  ## Options
+
+  - `prefix` - Only return keys starting with this prefix (default: "")
+  - `limit` - Maximum number of keys to return (default: 100)
+  - `cursor` - Cursor from a previous call to continue iteration
+
+  ## Examples
+
+      iex> Toska.KVStore.list_keys_cursor("user:", 10, nil)
+      {:ok, %{keys: ["user:1", "user:2"], next_cursor: "..."}}
+
+      iex> Toska.KVStore.list_keys_cursor("user:", 10, cursor)
+      {:ok, %{keys: ["user:11", "user:12"], next_cursor: nil}}
+
+  """
+  def list_keys_cursor(prefix \\ "", limit \\ 100, cursor \\ nil)
+
+  def list_keys_cursor(prefix, limit, cursor)
+      when is_binary(prefix) and is_integer(limit) and limit >= 0 do
+    case :ets.whereis(@table) do
+      :undefined ->
+        {:error, :not_running}
+
+      _ ->
+        if limit == 0 do
+          {:ok, %{keys: [], next_cursor: nil}}
+        else
+          case decode_cursor_key(cursor, prefix) do
+            {:error, :invalid_cursor} ->
+              {:error, :invalid_cursor}
+
+            {:ok, start_key} ->
+              now = now_ms()
+              chunk_size = max(min(limit + 1, 1000), 100)
+
+              {keys, has_more} = collect_keys_after(prefix, start_key, limit, now, chunk_size)
+
+              next_cursor =
+                if has_more and length(keys) == limit do
+                  last_key = List.last(keys)
+                  Toska.Cursor.encode(last_key, prefix)
+                else
+                  nil
+                end
+
+              {:ok, %{keys: keys, next_cursor: next_cursor}}
+          end
+        end
+    end
+  end
+
+  def list_keys_cursor(_, _, _), do: {:error, :invalid_args}
+
   def stats do
     case GenServer.whereis(__MODULE__) do
       nil -> {:error, :not_running}
@@ -595,6 +653,91 @@ defmodule Toska.KVStore do
         end
     end
   end
+
+  # Cursor-based key collection helpers
+
+  defp decode_cursor_key(nil, _prefix), do: {:ok, nil}
+  defp decode_cursor_key("", _prefix), do: {:ok, nil}
+
+  defp decode_cursor_key(cursor, expected_prefix) do
+    case Toska.Cursor.decode(cursor) do
+      {:ok, {key, ^expected_prefix}} -> {:ok, key}
+      {:ok, {_key, _different_prefix}} -> {:error, :invalid_cursor}
+      {:error, _} -> {:error, :invalid_cursor}
+    end
+  end
+
+  defp collect_keys_after(prefix, start_key, limit, now, _chunk_size) do
+    # Collect all matching keys, sort them, then paginate
+    # This is necessary because ETS doesn't iterate in sorted order,
+    # so cursor-based pagination requires sorting first
+    all_keys = collect_all_matching_keys(prefix, now)
+
+    # Sort keys for consistent pagination
+    sorted_keys = Enum.sort(all_keys)
+
+    # Filter to keys after cursor
+    filtered_keys =
+      case start_key do
+        nil -> sorted_keys
+        key -> Enum.filter(sorted_keys, &(&1 > key))
+      end
+
+    # Take limit+1 to detect if there are more
+    taken = Enum.take(filtered_keys, limit + 1)
+
+    if length(taken) > limit do
+      {Enum.take(taken, limit), true}
+    else
+      {taken, false}
+    end
+  end
+
+  defp collect_all_matching_keys(prefix, now) do
+    match_spec = [{{:"$1", :_, :"$2"}, [], [{{:"$1", :"$2"}}]}]
+
+    case :ets.select(@table, match_spec, 1000) do
+      :"$end_of_table" ->
+        []
+
+      {rows, continuation} ->
+        collect_all_matching_from(rows, continuation, prefix, now, [])
+    end
+  end
+
+  defp collect_all_matching_from(rows, continuation, prefix, now, acc) do
+    acc =
+      Enum.reduce(rows, acc, fn {key, expires_at}, acc ->
+        cond do
+          expired?(expires_at, now) ->
+            :ets.delete(@table, key)
+            acc
+
+          not matches_prefix?(key, prefix) ->
+            acc
+
+          true ->
+            [key | acc]
+        end
+      end)
+
+    case continuation do
+      :"$end_of_table" ->
+        acc
+
+      _ ->
+        case :ets.select(continuation) do
+          :"$end_of_table" ->
+            acc
+
+          {next_rows, next_continuation} ->
+            collect_all_matching_from(next_rows, next_continuation, prefix, now, acc)
+        end
+    end
+  end
+
+  defp matches_prefix?(_key, ""), do: true
+  defp matches_prefix?(key, prefix), do: String.starts_with?(key, prefix)
 
   defp append_aof(state, record) do
     if state.aof_io do

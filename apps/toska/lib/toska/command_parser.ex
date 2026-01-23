@@ -47,6 +47,12 @@ defmodule Toska.CommandParser do
       ["replicate" | rest] ->
         Commands.Replicate.execute(rest)
 
+      ["backup" | rest] ->
+        Commands.Backup.execute(rest)
+
+      ["restore" | rest] ->
+        Commands.Restore.execute(rest)
+
       [command | _] ->
         IO.puts("Unknown command: #{command}")
         show_help()
@@ -70,6 +76,8 @@ defmodule Toska.CommandParser do
       status    Check server status
       config    Manage configuration
       replicate Start replication follower
+      backup    Create backup of KV store
+      restore   Restore from backup
 
     Global Options:
       -h, --help    Show this help message
@@ -81,7 +89,10 @@ defmodule Toska.CommandParser do
       toska status
       toska config get port
       toska config set port 9000
+      toska config reload
       toska replicate --leader http://localhost:4000
+      toska backup /var/backups/toska/
+      toska restore /var/backups/toska/
 
     For command-specific help, use:
       toska [command] --help
