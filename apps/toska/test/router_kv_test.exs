@@ -179,9 +179,69 @@ defmodule Toska.RouterKVTest do
       |> Toska.Router.call(@opts)
 
     assert conn.status == 200
-    keys = Jason.decode!(conn.resp_body)["keys"]
-    assert length(keys) == 1
-    assert Enum.all?(keys, &String.starts_with?(&1, "a"))
+    body = Jason.decode!(conn.resp_body)
+    assert length(body["keys"]) == 1
+    assert Enum.all?(body["keys"], &String.starts_with?(&1, "a"))
+  end
+
+  test "list keys with cursor pagination" do
+    for i <- 1..15 do
+      key = "cur:#{String.pad_leading(to_string(i), 2, "0")}"
+      :ok = Toska.KVStore.put(key, to_string(i))
+    end
+
+    # First page
+    conn1 =
+      conn("GET", "/kv/keys?prefix=cur:&limit=5")
+      |> Toska.Router.call(@opts)
+
+    assert conn1.status == 200
+    page1 = Jason.decode!(conn1.resp_body)
+    assert length(page1["keys"]) == 5
+    assert page1["next_cursor"] != nil
+
+    # Second page using cursor
+    conn2 =
+      conn("GET", "/kv/keys?prefix=cur:&limit=5&cursor=#{page1["next_cursor"]}")
+      |> Toska.Router.call(@opts)
+
+    assert conn2.status == 200
+    page2 = Jason.decode!(conn2.resp_body)
+    assert length(page2["keys"]) == 5
+    assert page2["next_cursor"] != nil
+
+    # No overlap between pages
+    assert MapSet.disjoint?(MapSet.new(page1["keys"]), MapSet.new(page2["keys"]))
+
+    # Third page (final)
+    conn3 =
+      conn("GET", "/kv/keys?prefix=cur:&limit=5&cursor=#{page2["next_cursor"]}")
+      |> Toska.Router.call(@opts)
+
+    assert conn3.status == 200
+    page3 = Jason.decode!(conn3.resp_body)
+    assert length(page3["keys"]) == 5
+    assert page3["next_cursor"] == nil
+  end
+
+  test "list keys returns 400 for invalid cursor" do
+    conn =
+      conn("GET", "/kv/keys?cursor=invalid!!!")
+      |> Toska.Router.call(@opts)
+
+    assert conn.status == 400
+    assert Jason.decode!(conn.resp_body)["error"] == "Invalid cursor"
+  end
+
+  test "list keys returns 400 for cursor with mismatched prefix" do
+    :ok = Toska.KVStore.put("mismatch:1", "v")
+    cursor = Toska.Cursor.encode("mismatch:1", "mismatch:")
+
+    conn =
+      conn("GET", "/kv/keys?prefix=other:&cursor=#{cursor}")
+      |> Toska.Router.call(@opts)
+
+    assert conn.status == 400
   end
 
   test "replication aof rejects invalid offsets" do
@@ -357,6 +417,41 @@ defmodule Toska.RouterKVTest do
     if aof_conn.status == 200 do
       assert aof_conn.resp_body =~ "\"op\""
     end
+  end
+
+  test "request body too large returns 413" do
+    # Set a very small body size limit
+    original_max_body = System.get_env("TOSKA_MAX_BODY_SIZE")
+    System.put_env("TOSKA_MAX_BODY_SIZE", "100")
+
+    # Create a payload larger than 100 bytes
+    large_value = String.duplicate("x", 200)
+    body = Jason.encode!(%{value: large_value})
+
+    conn =
+      conn("PUT", "/kv/toolarge", body)
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("content-length", Integer.to_string(byte_size(body)))
+      |> Toska.Router.call(@opts)
+
+    assert conn.status == 413
+    assert Jason.decode!(conn.resp_body)["error"] == "Request body too large"
+
+    # Restore original
+    restore_env("TOSKA_MAX_BODY_SIZE", original_max_body)
+  end
+
+  test "request with acceptable body size succeeds" do
+    body = Jason.encode!(%{value: "small"})
+
+    conn =
+      conn("PUT", "/kv/smallbody", body)
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("content-length", Integer.to_string(byte_size(body)))
+      |> Toska.Router.call(@opts)
+
+    # PUT returns 200 for both new and updated keys
+    assert conn.status == 200
   end
 
   defp restore_env(key, nil), do: System.delete_env(key)

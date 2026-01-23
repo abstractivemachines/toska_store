@@ -238,7 +238,7 @@ defmodule Toska.Server do
   # Private helper functions
 
   defp start_http_server(state) do
-    bandit_options = [
+    base_options = [
       plug: Toska.Router,
       port: state.port,
       ip: parse_host(state.host),
@@ -256,6 +256,21 @@ defmodule Toska.Server do
       ]
     ]
 
+    bandit_options =
+      case build_tls_options() do
+        nil ->
+          base_options
+
+        tls_opts ->
+          Logger.info("TLS enabled for HTTP server")
+
+          base_options
+          |> Keyword.put(:scheme, :https)
+          |> Keyword.update!(:thousand_island_options, fn opts ->
+            Keyword.merge(opts, tls_opts)
+          end)
+      end
+
     case Bandit.start_link(bandit_options) do
       {:ok, pid} ->
         # Register the pid with our own name for management
@@ -267,6 +282,59 @@ defmodule Toska.Server do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp build_tls_options do
+    config = Toska.ConfigManager.tls_config()
+
+    if config.enabled and config.cert_file != "" and config.key_file != "" do
+      # Validate files exist
+      cert_path = Path.expand(config.cert_file)
+      key_path = Path.expand(config.key_file)
+
+      unless File.exists?(cert_path) do
+        Logger.error("TLS certificate file not found: #{cert_path}")
+        raise "TLS certificate file not found: #{cert_path}"
+      end
+
+      unless File.exists?(key_path) do
+        Logger.error("TLS key file not found: #{key_path}")
+        raise "TLS key file not found: #{key_path}"
+      end
+
+      base_tls = [
+        certfile: String.to_charlist(cert_path),
+        keyfile: String.to_charlist(key_path),
+        # Modern TLS settings
+        versions: [:"tlsv1.3", :"tlsv1.2"]
+      ]
+
+      tls_opts =
+        if config.verify_client and config.ca_cert_file != "" do
+          ca_path = Path.expand(config.ca_cert_file)
+
+          unless File.exists?(ca_path) do
+            Logger.error("TLS CA certificate file not found: #{ca_path}")
+            raise "TLS CA certificate file not found: #{ca_path}"
+          end
+
+          Logger.info("mTLS enabled - client certificate verification required")
+
+          # mTLS: require and verify client certificates
+          base_tls ++
+            [
+              cacertfile: String.to_charlist(ca_path),
+              verify: :verify_peer,
+              fail_if_no_peer_cert: true
+            ]
+        else
+          base_tls
+        end
+
+      [transport_options: tls_opts]
+    else
+      nil
     end
   end
 

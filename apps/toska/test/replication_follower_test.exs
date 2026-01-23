@@ -223,6 +223,45 @@ defmodule Toska.TestLeaderAofNoHeaderPlug do
   end
 end
 
+defmodule Toska.TestLeaderCorruptedAofPlug do
+  @moduledoc """
+  Mock leader that returns a mix of valid JSON, incomplete JSON, and non-JSON lines.
+  Used to test follower resilience to corrupted AOF data.
+  """
+  use Plug.Router
+
+  plug(:match)
+  plug(:dispatch)
+
+  get "/replication/snapshot" do
+    payload = %{"data" => %{}}
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, Jason.encode!(payload))
+  end
+
+  get "/replication/aof" do
+    # Mix of valid and invalid AOF lines
+    body = """
+    {"op":"set","key":"valid1","value":"ok","v":1}
+    {corrupted line without closing brace
+    {"op":"set","key":"valid2","value":"ok","v":1}
+    not json at all
+    {"op":"set","key":"valid3","value":"ok","v":1}
+    """
+
+    conn
+    |> put_resp_content_type("application/octet-stream")
+    |> put_resp_header("x-toska-aof-size", Integer.to_string(byte_size(body)))
+    |> send_resp(200, body)
+  end
+
+  match _ do
+    send_resp(conn, 404, "not_found")
+  end
+end
+
 defmodule Toska.ReplicationFollowerTest do
   use ExUnit.Case, async: false
 
@@ -422,6 +461,136 @@ defmodule Toska.ReplicationFollowerTest do
     assert {:error, :missing_leader_url} = Follower.start_link(leader_url: "")
 
     Process.flag(:trap_exit, previous)
+  end
+
+  @tag leader_plug: Toska.TestLeaderChunkPlug
+  test "handles multiple entries with chunk splitting mid-json", %{leader_url: leader_url} do
+    TestLeaderState.set_snapshot(%{"data" => %{}})
+
+    # First entry: small, fits in first chunk
+    TestLeaderState.append_aof(%{"op" => "set", "key" => "first", "value" => "1"})
+
+    # Second entry: large, will be split across chunks (65,536 byte chunk size)
+    large_value = String.duplicate("y", 64_000)
+    TestLeaderState.append_aof(%{"op" => "set", "key" => "split", "value" => large_value})
+
+    # Third entry: comes after the split
+    TestLeaderState.append_aof(%{"op" => "set", "key" => "third", "value" => "3"})
+
+    {:ok, _pid} =
+      Follower.start_link(leader_url: leader_url, poll_interval_ms: 25, http_timeout_ms: 1000)
+
+    assert :ok =
+             TestHelpers.wait_until(
+               fn ->
+                 match?({:ok, "1"}, KVStore.get("first")) and
+                   match?({:ok, ^large_value}, KVStore.get("split")) and
+                   match?({:ok, "3"}, KVStore.get("third"))
+               end,
+               5000
+             )
+  end
+
+  test "follower restarts from persisted offset", %{leader_url: leader_url} do
+    TestLeaderState.set_snapshot(%{"data" => %{}})
+    TestLeaderState.append_aof(%{"op" => "set", "key" => "before_restart", "value" => "1"})
+
+    {:ok, pid} =
+      Follower.start_link(leader_url: leader_url, poll_interval_ms: 50, http_timeout_ms: 1000)
+
+    # Wait for first entry to be applied
+    assert :ok =
+             TestHelpers.wait_until(
+               fn -> match?({:ok, "1"}, KVStore.get("before_restart")) end,
+               2000
+             )
+
+    # Get current offset and verify it's persisted
+    {:ok, status} = Follower.status()
+    persisted_offset = status.safe_offset
+    assert persisted_offset > 0
+
+    # Stop follower
+    GenServer.stop(pid)
+
+    # Add more entries while follower is down
+    TestLeaderState.append_aof(%{"op" => "set", "key" => "after_restart", "value" => "2"})
+
+    # Restart follower - should resume from persisted offset
+    {:ok, _pid2} =
+      Follower.start_link(leader_url: leader_url, poll_interval_ms: 50, http_timeout_ms: 1000)
+
+    # Both keys should be present - proves we didn't lose data
+    assert :ok =
+             TestHelpers.wait_until(
+               fn ->
+                 match?({:ok, "1"}, KVStore.get("before_restart")) and
+                   match?({:ok, "2"}, KVStore.get("after_restart"))
+               end,
+               2000
+             )
+
+    # Verify offset continued from where it left off
+    {:ok, new_status} = Follower.status()
+    assert new_status.offset >= persisted_offset
+  end
+
+  @tag leader_plug: Toska.TestLeaderCorruptedAofPlug
+  test "skips corrupted aof lines and continues", %{leader_url: leader_url} do
+    {:ok, _pid} =
+      Follower.start_link(leader_url: leader_url, poll_interval_ms: 50, http_timeout_ms: 1000)
+
+    # Valid entries should be applied despite corrupted lines interleaved
+    assert :ok =
+             TestHelpers.wait_until(
+               fn ->
+                 match?({:ok, "ok"}, KVStore.get("valid1")) and
+                   match?({:ok, "ok"}, KVStore.get("valid2")) and
+                   match?({:ok, "ok"}, KVStore.get("valid3"))
+               end,
+               2000
+             )
+  end
+
+  test "handles corrupted offset file gracefully", %{leader_url: leader_url} do
+    TestLeaderState.set_snapshot(%{"data" => %{}})
+    TestLeaderState.append_aof(%{"op" => "set", "key" => "after_corrupt", "value" => "v"})
+
+    # Write invalid data to offset file
+    offset_path = Path.join(System.get_env("TOSKA_DATA_DIR"), "replica.offset")
+    File.write!(offset_path, "not-a-number\n")
+
+    {:ok, _pid} =
+      Follower.start_link(leader_url: leader_url, poll_interval_ms: 50, http_timeout_ms: 1000)
+
+    # Should start from offset 0 when file is corrupted and apply entries
+    assert :ok =
+             TestHelpers.wait_until(
+               fn -> match?({:ok, "v"}, KVStore.get("after_corrupt")) end,
+               2000
+             )
+
+    {:ok, status} = Follower.status()
+    assert status.offset > 0
+  end
+
+  test "handles negative offset in file gracefully", %{leader_url: leader_url} do
+    TestLeaderState.set_snapshot(%{"data" => %{}})
+    TestLeaderState.append_aof(%{"op" => "set", "key" => "neg_offset", "value" => "v"})
+
+    # Write negative offset
+    offset_path = Path.join(System.get_env("TOSKA_DATA_DIR"), "replica.offset")
+    File.write!(offset_path, "-100")
+
+    {:ok, _pid} =
+      Follower.start_link(leader_url: leader_url, poll_interval_ms: 50, http_timeout_ms: 1000)
+
+    # Should clamp to 0 and apply entries
+    assert :ok =
+             TestHelpers.wait_until(
+               fn -> match?({:ok, "v"}, KVStore.get("neg_offset")) end,
+               2000
+             )
   end
 
   defp stop_store do
