@@ -88,6 +88,19 @@ defmodule Toska.KVStoreTest do
     assert {:ok, "ok"} = Toska.KVStore.get("rep")
   end
 
+  test "apply_replication persists checksums without breaking replay" do
+    record = %{"v" => 1, "op" => "set", "key" => "repersist", "value" => "ok"}
+    record = Map.put(record, "checksum", checksum(record))
+
+    assert :ok = Toska.KVStore.apply_replication([record])
+    assert {:ok, "ok"} = Toska.KVStore.get("repersist")
+
+    stop_store()
+    start_store()
+
+    assert {:ok, "ok"} = Toska.KVStore.get("repersist")
+  end
+
   test "apply_replication skips invalid checksum records" do
     record = %{"v" => 1, "op" => "set", "key" => "bad", "value" => "1", "checksum" => "bad"}
     assert :ok = Toska.KVStore.apply_replication(record)

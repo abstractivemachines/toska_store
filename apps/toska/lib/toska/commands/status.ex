@@ -82,7 +82,7 @@ defmodule Toska.Commands.Status do
     base_info = %{
       server_status: server_status.status,
       uptime: server_status.uptime,
-      version: "0.1.0",
+      version: Toska.version(),
       timestamp: DateTime.utc_now()
     }
 

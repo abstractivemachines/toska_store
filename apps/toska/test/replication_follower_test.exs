@@ -79,6 +79,70 @@ defmodule Toska.TestLeaderPlug do
   defp parse_offset(_), do: 0
 end
 
+defmodule Toska.TestLeaderChunkPlug do
+  use Plug.Router
+
+  plug(:match)
+  plug(:dispatch)
+
+  get "/replication/snapshot" do
+    payload = Toska.TestLeaderState.snapshot()
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, Jason.encode!(payload))
+  end
+
+  get "/replication/aof" do
+    conn = fetch_query_params(conn)
+    offset = parse_offset(conn.params["since"])
+    max_bytes = parse_max_bytes(conn.params["max_bytes"])
+    {body, size} = Toska.TestLeaderState.aof_since(offset)
+
+    chunk =
+      if byte_size(body) > max_bytes do
+        binary_part(body, 0, max_bytes)
+      else
+        body
+      end
+
+    conn =
+      conn
+      |> put_resp_content_type("application/octet-stream")
+      |> put_resp_header("x-toska-aof-size", Integer.to_string(size))
+
+    status = if offset >= size, do: 204, else: 200
+    send_resp(conn, status, chunk)
+  end
+
+  match _ do
+    send_resp(conn, 404, "not_found")
+  end
+
+  defp parse_offset(nil), do: 0
+  defp parse_offset(offset) when is_integer(offset), do: max(offset, 0)
+
+  defp parse_offset(offset) when is_binary(offset) do
+    case Integer.parse(offset) do
+      {value, ""} -> max(value, 0)
+      _ -> 0
+    end
+  end
+
+  defp parse_offset(_), do: 0
+
+  defp parse_max_bytes(nil), do: 65_536
+
+  defp parse_max_bytes(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} when int > 0 -> int
+      _ -> 65_536
+    end
+  end
+
+  defp parse_max_bytes(_), do: 65_536
+end
+
 defmodule Toska.TestLeaderErrorPlug do
   use Plug.Router
 
@@ -328,6 +392,28 @@ defmodule Toska.ReplicationFollowerTest do
 
     assert {:ok, status} = Follower.status()
     assert status.offset > 0
+  end
+
+  @tag leader_plug: Toska.TestLeaderChunkPlug
+  test "applies aof entries split across chunks", %{leader_url: leader_url} do
+    TestLeaderState.set_snapshot(%{"data" => %{}})
+
+    large_value = String.duplicate("x", 70_000)
+    TestLeaderState.append_aof(%{"op" => "set", "key" => "chunked", "value" => large_value})
+
+    {:ok, _pid} =
+      Follower.start_link(leader_url: leader_url, poll_interval_ms: 25, http_timeout_ms: 1000)
+
+    assert :ok =
+             TestHelpers.wait_until(
+               fn ->
+                 case KVStore.get("chunked") do
+                   {:ok, value} -> value == large_value
+                   _ -> false
+                 end
+               end,
+               3000
+             )
   end
 
   test "start_link fails without leader url" do

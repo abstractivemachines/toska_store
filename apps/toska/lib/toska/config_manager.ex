@@ -322,7 +322,18 @@ defmodule Toska.ConfigManager do
   defp save_config(config, file_path) do
     case Jason.encode(config, pretty: true) do
       {:ok, json} ->
-        File.write(file_path, json)
+        case File.write(file_path, json) do
+          :ok ->
+            case File.chmod(file_path, 0o600) do
+              :ok -> :ok
+              {:error, reason} ->
+                Logger.warning("Failed to chmod config file: #{inspect(reason)}")
+                :ok
+            end
+
+          {:error, reason} ->
+            {:error, reason}
+        end
 
       {:error, reason} ->
         {:error, reason}
