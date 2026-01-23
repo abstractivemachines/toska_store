@@ -37,6 +37,8 @@ defmodule Toska.Replication.Follower do
         poll_interval_ms: Keyword.get(opts, :poll_interval_ms, @default_poll_interval_ms),
         http_timeout_ms: Keyword.get(opts, :http_timeout_ms, @default_http_timeout_ms),
         offset: 0,
+        safe_offset: 0,
+        buffer: "",
         offset_path: offset_path(),
         last_snapshot_at: nil,
         last_poll_at: nil,
@@ -87,6 +89,7 @@ defmodule Toska.Replication.Follower do
     reply = %{
       leader_url: state.leader_url,
       offset: state.offset,
+      safe_offset: state.safe_offset,
       last_snapshot_at: state.last_snapshot_at,
       last_poll_at: state.last_poll_at,
       last_error: state.last_error,
@@ -109,7 +112,14 @@ defmodule Toska.Replication.Follower do
       {:ok, payload} ->
         case KVStore.replace_snapshot(payload) do
           :ok ->
-            state = %{state | offset: 0, last_snapshot_at: System.system_time(:millisecond)}
+            state = %{
+              state
+              | offset: 0,
+                safe_offset: 0,
+                buffer: "",
+                last_snapshot_at: System.system_time(:millisecond)
+            }
+
             {persist_offset(state), :ok}
 
           {:error, reason} ->
@@ -150,22 +160,28 @@ defmodule Toska.Replication.Follower do
     case http_get(url, state.http_timeout_ms, auth_headers()) do
       {:ok, 204, headers, _body} ->
         response_size = parse_aof_size(headers, state.offset)
+        next_offset = max(state.offset, response_size)
 
         state =
           state
-          |> Map.put(:offset, max(state.offset, response_size))
+          |> Map.put(:offset, next_offset)
+          |> Map.put(:safe_offset, min(state.safe_offset, next_offset))
           |> Map.put(:last_poll_at, System.system_time(:millisecond))
 
         {:ok, persist_offset(state)}
 
       {:ok, 200, headers, body} ->
-        :ok = apply_aof_body(body)
-        response_size = parse_aof_size(headers, state.offset + byte_size(body))
-        next_offset = max(state.offset + byte_size(body), response_size)
+        {buffer, safe_offset} = apply_aof_body(body, state)
+        next_offset = state.offset + byte_size(body)
+        response_size = parse_aof_size(headers, next_offset)
+        next_offset = min(next_offset, response_size)
+        safe_offset = min(safe_offset, next_offset)
 
         state =
           state
           |> Map.put(:offset, next_offset)
+          |> Map.put(:safe_offset, safe_offset)
+          |> Map.put(:buffer, buffer)
           |> Map.put(:last_poll_at, System.system_time(:millisecond))
 
         state = persist_offset(state)
@@ -180,17 +196,31 @@ defmodule Toska.Replication.Follower do
     end
   end
 
-  defp apply_aof_body(body) do
-    body
-    |> String.split("\n", trim: true)
-    |> Enum.each(fn line ->
-      case Jason.decode(line) do
-        {:ok, record} -> KVStore.apply_replication(record)
-        {:error, _} -> :ok
-      end
-    end)
+  defp apply_aof_body(body, state) do
+    data = state.buffer <> body
+    {lines, buffer} = split_aof_lines(data)
 
-    :ok
+    Enum.each(lines, &apply_aof_line/1)
+
+    safe_offset = state.offset + byte_size(body) - byte_size(buffer)
+    {buffer, safe_offset}
+  end
+
+  defp split_aof_lines(data) do
+    parts = String.split(data, "\n", trim: false)
+
+    case List.last(parts) do
+      "" -> {Enum.drop(parts, -1), ""}
+      last -> {Enum.drop(parts, -1), last}
+    end
+  end
+
+  defp apply_aof_line(""), do: :ok
+  defp apply_aof_line(line) do
+    case Jason.decode(line) do
+      {:ok, record} -> KVStore.apply_replication(record)
+      {:error, _} -> :ok
+    end
   end
 
   defp parse_aof_size(headers, fallback) do
@@ -254,17 +284,37 @@ defmodule Toska.Replication.Follower do
 
   defp offset_path do
     case System.get_env("TOSKA_DATA_DIR") do
-      nil -> Path.join([System.user_home(), ".toska", "data", "replica.offset"])
-      "" -> Path.join([System.user_home(), ".toska", "data", "replica.offset"])
+      nil -> Path.join([data_dir(), "replica.offset"])
+      "" -> Path.join([data_dir(), "replica.offset"])
       dir -> Path.join([dir, "replica.offset"])
     end
+  end
+
+  defp data_dir do
+    case GenServer.whereis(ConfigManager) do
+      nil ->
+        default_data_dir()
+
+      _pid ->
+        case ConfigManager.list() do
+          {:ok, config} -> config["data_dir"] || default_data_dir()
+          _ -> default_data_dir()
+        end
+    end
+  end
+
+  defp default_data_dir do
+    Path.join([ConfigManager.config_dir(), "data"])
   end
 
   defp load_offset(state) do
     case File.read(state.offset_path) do
       {:ok, content} ->
         case Integer.parse(String.trim(content)) do
-          {value, ""} -> %{state | offset: max(value, 0)}
+          {value, ""} ->
+            value = max(value, 0)
+            %{state | offset: value, safe_offset: value}
+
           _ -> state
         end
 
@@ -275,7 +325,7 @@ defmodule Toska.Replication.Follower do
 
   defp persist_offset(state) do
     File.mkdir_p!(Path.dirname(state.offset_path))
-    File.write(state.offset_path, Integer.to_string(state.offset))
+    File.write(state.offset_path, Integer.to_string(state.safe_offset))
     state
   end
 end

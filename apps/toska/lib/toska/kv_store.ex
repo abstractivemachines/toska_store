@@ -824,6 +824,7 @@ defmodule Toska.KVStore do
     base =
       record
       |> Map.new(fn {key, value} -> {to_string(key), value} end)
+      |> Map.drop(["checksum"])
       |> Map.put("v", @aof_version)
 
     checksum = aof_checksum(base)
