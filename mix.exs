@@ -4,7 +4,7 @@ defmodule ToskaStore.MixProject do
   def project do
     [
       apps_path: "apps",
-      version: "0.8.0",
+      version: "0.9.1",
       start_permanent: Mix.env() == :prod,
       deps: deps()
     ]

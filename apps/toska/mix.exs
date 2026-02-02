@@ -4,7 +4,7 @@ defmodule Toska.MixProject do
   def project do
     [
       app: :toska,
-      version: "0.8.0",
+      version: "0.9.1",
       build_path: "../../_build",
       config_path: "../../config/config.exs",
       deps_path: "../../deps",

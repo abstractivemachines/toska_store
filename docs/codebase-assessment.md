@@ -6,7 +6,7 @@ This document provides an analysis of the ToskaStore codebase, identifying archi
 
 ToskaStore is a disk-backed key-value store written in Elixir with an HTTP/JSON REST API and CLI interface. It uses ETS for in-memory storage with AOF (Append-Only File) and snapshots for persistence.
 
-**Version**: 0.8.0
+**Version**: 0.9.1
 **Type**: Umbrella Elixir project
 
 ## Project Structure
