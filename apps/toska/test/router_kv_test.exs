@@ -244,6 +244,33 @@ defmodule Toska.RouterKVTest do
     assert conn.status == 400
   end
 
+  test "list keys rejects invalid limits" do
+    invalid_conn =
+      conn("GET", "/kv/keys?limit=abc")
+      |> Toska.Router.call(@opts)
+
+    assert invalid_conn.status == 400
+    assert Jason.decode!(invalid_conn.resp_body)["error"] == "Invalid limit"
+
+    negative_conn =
+      conn("GET", "/kv/keys?limit=-1")
+      |> Toska.Router.call(@opts)
+
+    assert negative_conn.status == 400
+    assert Jason.decode!(negative_conn.resp_body)["error"] == "Invalid limit"
+  end
+
+  test "list keys caps excessive limits" do
+    conn =
+      conn("GET", "/kv/keys?limit=1001")
+      |> Toska.Router.call(@opts)
+
+    assert conn.status == 400
+    body = Jason.decode!(conn.resp_body)
+    assert body["error"] == "Limit too large"
+    assert body["max"] == 1000
+  end
+
   test "replication aof rejects invalid offsets" do
     bad_conn =
       conn("GET", "/replication/aof?since=bad")

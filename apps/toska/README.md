@@ -166,7 +166,7 @@ toska replicate --leader http://localhost:4000 --daemon
 When the server is running, the HTTP API provides a simple JSON key/value store:
 
 - `GET /kv/:key` - Fetch a value by key
-- `GET /kv/keys` - List keys (`?prefix=todo:` optional, `?limit=100` optional)
+- `GET /kv/keys` - List keys in lexicographic order (`?prefix=todo:` optional, `?limit=100` optional, max `1000`, `?cursor=...` for the next page)
 - `PUT /kv/:key` - Set a value with optional `ttl_ms` (`{"value": "...", "ttl_ms": 5000}`)
 - `DELETE /kv/:key` - Remove a key
 - `POST /kv/mget` - Fetch multiple keys (`{"keys": ["a", "b"]}`)
@@ -182,6 +182,8 @@ When follower mode is enabled, KV write endpoints (`PUT`/`DELETE`) return `403` 
 KV endpoints (`/kv/*` and `/stats`) can require an auth token and apply rate limits:
 - `auth_token` (or `TOSKA_AUTH_TOKEN`) expects `Authorization: Bearer <token>` or `X-Toska-Token`.
 - `rate_limit_per_sec` + `rate_limit_burst` (or `TOSKA_RATE_LIMIT_PER_SEC`, `TOSKA_RATE_LIMIT_BURST`).
+
+`GET /kv/keys` returns `{"keys": [...], "next_cursor": "..."}`. When `next_cursor` is present, pass it back as `cursor` with the same `prefix` to fetch the next page. `limit` defaults to `100`, may be `0`, and cannot exceed `1000`.
 
 ## Configuration
 

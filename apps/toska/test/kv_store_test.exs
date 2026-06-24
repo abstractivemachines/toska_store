@@ -131,8 +131,8 @@ defmodule Toska.KVStoreTest do
   end
 
   test "list_keys honors prefix and limit" do
-    assert :ok = Toska.KVStore.put("a1", "1")
     assert :ok = Toska.KVStore.put("a2", "2")
+    assert :ok = Toska.KVStore.put("a1", "1")
     assert :ok = Toska.KVStore.put("b1", "3")
 
     assert {:ok, []} = Toska.KVStore.list_keys("", 0)
@@ -142,7 +142,7 @@ defmodule Toska.KVStoreTest do
     assert Enum.all?(keys, &String.starts_with?(&1, "a"))
 
     assert {:ok, all_a} = Toska.KVStore.list_keys("a", 10)
-    assert Enum.sort(all_a) == ["a1", "a2"]
+    assert all_a == ["a1", "a2"]
   end
 
   test "list_keys validates arguments" do

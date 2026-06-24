@@ -6,25 +6,29 @@ defmodule Toska.Router do
   """
 
   use Plug.Router
-  require Logger
 
   alias Toska.ConfigManager
   alias Toska.RateLimiter
+
+  @max_key_list_limit 1000
 
   # Default max body size: 10MB. Can be overridden via TOSKA_MAX_BODY_SIZE env var
   # or max_body_size config key.
   @default_max_body_size 10_485_760
 
-  plug Plug.Logger
-  plug :check_content_length
-  plug Plug.Parsers,
+  plug(Plug.Logger)
+  plug(:check_content_length)
+
+  plug(Plug.Parsers,
     parsers: [:json],
     pass: ["application/json"],
     json_decoder: Jason,
     length: @default_max_body_size
-  plug :ensure_kv_access
-  plug :match
-  plug :dispatch
+  )
+
+  plug(:ensure_kv_access)
+  plug(:match)
+  plug(:dispatch)
 
   # Check Content-Length header against configured max body size
   defp check_content_length(conn, _opts) do
@@ -113,11 +117,12 @@ defmodule Toska.Router do
   get "/health" do
     status = Toska.Server.status()
 
-    health_status = case status.status do
-      :running -> "healthy"
-      :starting -> "starting"
-      _ -> "unhealthy"
-    end
+    health_status =
+      case status.status do
+        :running -> "healthy"
+        :starting -> "starting"
+        _ -> "unhealthy"
+      end
 
     response = %{
       status: health_status,
@@ -143,7 +148,10 @@ defmodule Toska.Router do
       {:error, reason} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(503, Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)}))
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)})
+        )
     end
   end
 
@@ -188,7 +196,10 @@ defmodule Toska.Router do
       {:error, reason} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(503, Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)}))
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)})
+        )
     end
   end
 
@@ -208,7 +219,10 @@ defmodule Toska.Router do
       {:error, reason} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(503, Jason.encode!(%{error: "Follower unavailable", reason: inspect(reason)}))
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "Follower unavailable", reason: inspect(reason)})
+        )
     end
   end
 
@@ -232,18 +246,27 @@ defmodule Toska.Router do
           {_, {:error, reason}} ->
             conn
             |> put_resp_content_type("application/json")
-            |> send_resp(503, Jason.encode!(%{error: "Snapshot unavailable", reason: inspect(reason)}))
+            |> send_resp(
+              503,
+              Jason.encode!(%{error: "Snapshot unavailable", reason: inspect(reason)})
+            )
 
           {{:error, reason}, _} ->
             conn
             |> put_resp_content_type("application/json")
-            |> send_resp(503, Jason.encode!(%{error: "Snapshot unavailable", reason: inspect(reason)}))
+            |> send_resp(
+              503,
+              Jason.encode!(%{error: "Snapshot unavailable", reason: inspect(reason)})
+            )
         end
 
       {:error, reason} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(503, Jason.encode!(%{error: "Snapshot unavailable", reason: inspect(reason)}))
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "Snapshot unavailable", reason: inspect(reason)})
+        )
     end
   end
 
@@ -272,6 +295,7 @@ defmodule Toska.Router do
 
         true ->
           to_send = min(size - offset, max_bytes)
+
           conn
           |> put_resp_content_type("application/octet-stream")
           |> put_resp_header("x-toska-aof-size", Integer.to_string(size))
@@ -294,14 +318,23 @@ defmodule Toska.Router do
   # GET /kv/keys - list keys with cursor-based pagination
   get "/kv/keys" do
     prefix = conn.params["prefix"] || ""
-    limit = parse_int(conn.params["limit"], 100)
     cursor = conn.params["cursor"]
 
-    case Toska.KVStore.list_keys_cursor(prefix, limit, cursor) do
-      {:ok, result} ->
+    with {:ok, limit} <- parse_key_list_limit(conn.params["limit"]),
+         {:ok, result} <- Toska.KVStore.list_keys_cursor(prefix, limit, cursor) do
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(200, Jason.encode!(result))
+    else
+      {:error, :invalid_limit} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(200, Jason.encode!(result))
+        |> send_resp(400, Jason.encode!(%{error: "Invalid limit"}))
+
+      {:error, :limit_too_large} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(400, Jason.encode!(%{error: "Limit too large", max: @max_key_list_limit}))
 
       {:error, :invalid_cursor} ->
         conn
@@ -316,7 +349,10 @@ defmodule Toska.Router do
       {:error, reason} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(503, Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)}))
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)})
+        )
     end
   end
 
@@ -336,7 +372,10 @@ defmodule Toska.Router do
       {:error, reason} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(503, Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)}))
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)})
+        )
     end
   end
 
@@ -361,7 +400,10 @@ defmodule Toska.Router do
           {:error, reason} ->
             conn
             |> put_resp_content_type("application/json")
-            |> send_resp(503, Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)}))
+            |> send_resp(
+              503,
+              Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)})
+            )
         end
     end
   end
@@ -377,7 +419,10 @@ defmodule Toska.Router do
       {:error, reason} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(503, Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)}))
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)})
+        )
     end
   end
 
@@ -401,7 +446,10 @@ defmodule Toska.Router do
           {:error, reason} ->
             conn
             |> put_resp_content_type("application/json")
-            |> send_resp(503, Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)}))
+            |> send_resp(
+              503,
+              Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)})
+            )
         end
     end
   end
@@ -419,7 +467,8 @@ defmodule Toska.Router do
   defp status_class(:stopped), do: "stopped"
   defp status_class(_), do: "error"
 
-  defp status_details(%{status: :running, uptime: uptime, config: config}) when not is_nil(config) do
+  defp status_details(%{status: :running, uptime: uptime, config: config})
+       when not is_nil(config) do
     """
     <p><strong>Uptime:</strong> #{format_uptime(uptime)}</p>
     <p><strong>Configuration:</strong></p>
@@ -436,6 +485,7 @@ defmodule Toska.Router do
   end
 
   defp format_uptime(nil), do: "N/A"
+
   defp format_uptime(uptime_ms) do
     seconds = div(uptime_ms, 1000)
     minutes = div(seconds, 60)
@@ -450,6 +500,7 @@ defmodule Toska.Router do
 
   defp parse_offset(nil), do: {:ok, 0}
   defp parse_offset(offset) when is_integer(offset), do: {:ok, offset}
+
   defp parse_offset(offset) when is_binary(offset) do
     case Integer.parse(offset) do
       {value, ""} -> {:ok, value}
@@ -460,6 +511,7 @@ defmodule Toska.Router do
   defp parse_offset(_), do: {:error, :invalid_offset}
 
   defp parse_max_bytes(nil), do: 1024 * 1024
+
   defp parse_max_bytes(value) when is_binary(value) do
     case Integer.parse(value) do
       {int, ""} when int > 0 -> int
@@ -478,12 +530,22 @@ defmodule Toska.Router do
 
   defp put_replication_headers(conn, info) do
     conn
-    |> maybe_put_header("x-toska-snapshot-checksum", Map.get(info, "snapshot_checksum") || Map.get(info, :snapshot_checksum))
-    |> maybe_put_header("x-toska-snapshot-version", Map.get(info, "snapshot_version") || Map.get(info, :snapshot_version))
-    |> maybe_put_header("x-toska-aof-version", Map.get(info, "aof_version") || Map.get(info, :aof_version))
+    |> maybe_put_header(
+      "x-toska-snapshot-checksum",
+      Map.get(info, "snapshot_checksum") || Map.get(info, :snapshot_checksum)
+    )
+    |> maybe_put_header(
+      "x-toska-snapshot-version",
+      Map.get(info, "snapshot_version") || Map.get(info, :snapshot_version)
+    )
+    |> maybe_put_header(
+      "x-toska-aof-version",
+      Map.get(info, "aof_version") || Map.get(info, :aof_version)
+    )
   end
 
   defp maybe_put_header(conn, _key, nil), do: conn
+
   defp maybe_put_header(conn, key, value) do
     put_resp_header(conn, key, to_string(value))
   end
@@ -500,6 +562,7 @@ defmodule Toska.Router do
   end
 
   defp ensure_auth(%Plug.Conn{halted: true} = conn), do: conn
+
   defp ensure_auth(conn) do
     token = auth_token(conn.request_path)
 
@@ -521,6 +584,7 @@ defmodule Toska.Router do
   end
 
   defp ensure_rate_limit(%Plug.Conn{halted: true} = conn), do: conn
+
   defp ensure_rate_limit(conn) do
     {per_sec, burst} = rate_limit_config()
 
@@ -535,6 +599,7 @@ defmodule Toska.Router do
   end
 
   defp ensure_read_only(%Plug.Conn{halted: true} = conn), do: conn
+
   defp ensure_read_only(conn) do
     if follower_mode?() and write_request?(conn) do
       conn
@@ -572,24 +637,35 @@ defmodule Toska.Router do
   end
 
   defp token_match?(_token, nil), do: false
+
   defp token_match?(token, header) when is_binary(header) do
     header == token or header == "Bearer #{token}"
   end
+
   defp token_match?(_token, _header), do: false
 
   defp rate_limit_config do
     ConfigManager.cached_rate_limit()
   end
 
-  defp parse_int(nil, default), do: default
-  defp parse_int(value, default) when is_binary(value) do
+  defp parse_key_list_limit(nil), do: {:ok, 100}
+
+  defp parse_key_list_limit(value) when is_binary(value) do
     case Integer.parse(value) do
-      {int, ""} when int >= 0 -> int
-      _ -> default
+      {int, ""} -> validate_key_list_limit(int)
+      _ -> {:error, :invalid_limit}
     end
   end
-  defp parse_int(value, _default) when is_integer(value) and value >= 0, do: value
-  defp parse_int(_, default), do: default
+
+  defp parse_key_list_limit(value) when is_integer(value), do: validate_key_list_limit(value)
+  defp parse_key_list_limit(_), do: {:error, :invalid_limit}
+
+  defp validate_key_list_limit(value) when value < 0, do: {:error, :invalid_limit}
+
+  defp validate_key_list_limit(value) when value > @max_key_list_limit,
+    do: {:error, :limit_too_large}
+
+  defp validate_key_list_limit(value), do: {:ok, value}
 
   defp client_key(conn) do
     case conn.remote_ip do
