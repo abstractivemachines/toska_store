@@ -454,6 +454,69 @@ defmodule Toska.RouterKVTest do
     assert Enum.all?(body["keys"], &String.starts_with?(&1, "a"))
   end
 
+  test "range endpoint supports prefix start limit and cursor pagination" do
+    for key <- ["scan:03", "scan:01", "skip:01", "scan:02", "scan:04"] do
+      :ok = Toska.KVStore.put(key, key)
+    end
+
+    conn1 =
+      conn("GET", "/kv?prefix=scan:&start=scan:02&limit=2")
+      |> Toska.Router.call(@opts)
+
+    assert conn1.status == 200
+    page1 = Jason.decode!(conn1.resp_body)
+    assert Enum.map(page1["items"], & &1["key"]) == ["scan:02", "scan:03"]
+    assert page1["next_cursor"] != nil
+
+    conn2 =
+      conn("GET", "/kv?prefix=scan:&limit=2&cursor=#{page1["next_cursor"]}")
+      |> Toska.Router.call(@opts)
+
+    assert conn2.status == 200
+    page2 = Jason.decode!(conn2.resp_body)
+    assert Enum.map(page2["items"], & &1["key"]) == ["scan:04"]
+    assert page2["next_cursor"] == nil
+  end
+
+  test "range endpoint can include values and metadata" do
+    {:ok, lease} = Toska.KVStore.create_lease(5_000, id: "http-range-lease")
+    :ok = Toska.KVStore.put("scan-rich:1", "value", nil, lease_id: lease.id)
+
+    conn =
+      conn("GET", "/kv?prefix=scan-rich:&include_values=true&include_metadata=true")
+      |> Toska.Router.call(@opts)
+
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+
+    assert [
+             %{
+               "key" => "scan-rich:1",
+               "value" => "value",
+               "metadata" => metadata
+             }
+           ] = body["items"]
+
+    assert metadata["version"] == 1
+    assert metadata["lease_id"] == lease.id
+  end
+
+  test "range endpoint rejects invalid parameters" do
+    bad_bool_conn =
+      conn("GET", "/kv?include_values=yes")
+      |> Toska.Router.call(@opts)
+
+    assert bad_bool_conn.status == 400
+    assert Jason.decode!(bad_bool_conn.resp_body)["error"] == "Invalid range parameters"
+
+    bad_cursor_conn =
+      conn("GET", "/kv?cursor=invalid!!!")
+      |> Toska.Router.call(@opts)
+
+    assert bad_cursor_conn.status == 400
+    assert Jason.decode!(bad_cursor_conn.resp_body)["error"] == "Invalid cursor"
+  end
+
   test "list keys with cursor pagination" do
     for i <- 1..15 do
       key = "cur:#{String.pad_leading(to_string(i), 2, "0")}"

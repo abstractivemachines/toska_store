@@ -188,6 +188,7 @@ When the server is running, the HTTP API provides a simple JSON key/value store:
 - `GET /` - Welcome page with server status
 - `GET /status` - JSON status
 - `GET /health` - Health check
+- `GET /kv` - Range scan keys with cursor pagination (`?prefix=todo:&start=todo:1&limit=100`)
 - `GET /kv/keys` - List keys in lexicographic order (`?prefix=todo:` optional, `?limit=100` optional, max `1000`, `?cursor=...` for the next page)
 - `GET /kv/:key` - Fetch a value by key
 - `PUT /kv/:key` - Set a value with optional `ttl_ms` (`{"value": "...", "ttl_ms": 5000}`)
@@ -334,6 +335,43 @@ curl -s -X POST http://localhost:4000/locks/nightly/release \
 ```
 
 Lock acquisition returns `409` when another active lease owns the lock. Releasing a lock with the wrong lease returns `409`; missing leases or locks return `404`.
+
+### Prefix Range API
+
+`GET /kv` returns a lexicographic range from the ordered key index. This is the preferred API for scalable prefix scans because it pages from the index instead of collecting and sorting all matching keys first.
+
+```bash
+curl -s "http://localhost:4000/kv?prefix=todo:&start=todo:100&limit=50"
+```
+
+Response:
+
+```json
+{
+  "items": [
+    {"key": "todo:100"},
+    {"key": "todo:101"}
+  ],
+  "next_cursor": null
+}
+```
+
+Query parameters:
+
+- `prefix` filters results to matching keys.
+- `start` is an inclusive lower-bound key for the first page.
+- `cursor` continues after the last key returned by a previous page.
+- `limit` defaults to `100`, may be `0`, and cannot exceed `1000`.
+- `include_values=true` adds each key's value to returned items.
+- `include_metadata=true` adds the key metadata object to returned items.
+
+When `next_cursor` is present, pass it back with the same `prefix` to fetch the next page. Invalid cursors, booleans, or limits return `400`.
+
+Example with values and metadata:
+
+```bash
+curl -s "http://localhost:4000/kv?prefix=todo:&include_values=true&include_metadata=true"
+```
 
 ### Key Listing
 

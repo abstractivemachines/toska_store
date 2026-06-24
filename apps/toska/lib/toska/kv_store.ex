@@ -9,6 +9,7 @@ defmodule Toska.KVStore do
   alias Toska.ConfigManager
 
   @table :toska_kv
+  @key_index_table :toska_kv_keys
   @default_sync_mode :interval
   @default_sync_interval_ms 1000
   @default_snapshot_interval_ms 60_000
@@ -145,39 +146,60 @@ defmodule Toska.KVStore do
 
   def list_keys_cursor(prefix, limit, cursor)
       when is_binary(prefix) and is_integer(limit) and limit >= 0 do
-    case :ets.whereis(@table) do
-      :undefined ->
-        {:error, :not_running}
+    case list_range(prefix, limit, cursor: cursor) do
+      {:ok, %{items: items, next_cursor: next_cursor}} ->
+        {:ok, %{keys: Enum.map(items, & &1.key), next_cursor: next_cursor}}
 
-      _ ->
-        if limit == 0 do
-          {:ok, %{keys: [], next_cursor: nil}}
-        else
-          case decode_cursor_key(cursor, prefix) do
-            {:error, :invalid_cursor} ->
-              {:error, :invalid_cursor}
-
-            {:ok, start_key} ->
-              now = now_ms()
-              chunk_size = max(min(limit + 1, 1000), 100)
-
-              {keys, has_more} = collect_keys_after(prefix, start_key, limit, now, chunk_size)
-
-              next_cursor =
-                if has_more and length(keys) == limit do
-                  last_key = List.last(keys)
-                  Toska.Cursor.encode(last_key, prefix)
-                else
-                  nil
-                end
-
-              {:ok, %{keys: keys, next_cursor: next_cursor}}
-          end
-        end
+      other ->
+        other
     end
   end
 
   def list_keys_cursor(_, _, _), do: {:error, :invalid_args}
+
+  @doc """
+  List a lexicographic key range with cursor-based pagination.
+
+  Returns `{:ok, %{items: [map()], next_cursor: String.t() | nil}}`.
+
+  ## Options
+
+  - `cursor` - Cursor from a previous call to continue iteration
+  - `start` - Inclusive lower-bound key for the first page
+  - `include_values` - Include values in returned items
+  - `include_metadata` - Include entry metadata in returned items
+  """
+  def list_range(prefix \\ "", limit \\ 100, opts \\ [])
+
+  def list_range(prefix, limit, opts)
+      when is_binary(prefix) and is_integer(limit) and limit >= 0 do
+    with :ok <- ensure_read_tables(),
+         {:ok, opts} <- normalize_range_options(opts),
+         {:ok, cursor_key} <- decode_cursor_key(opts.cursor, prefix) do
+      if limit == 0 do
+        {:ok, %{items: [], next_cursor: nil}}
+      else
+        now = now_ms()
+        start = range_start(prefix, opts.start, cursor_key)
+        {entries, has_more} = collect_range_entries(prefix, start, limit, now)
+
+        next_cursor =
+          if has_more and length(entries) == limit do
+            entries
+            |> List.last()
+            |> Map.fetch!(:key)
+            |> Toska.Cursor.encode(prefix)
+          else
+            nil
+          end
+
+        items = Enum.map(entries, &range_item(&1, opts))
+        {:ok, %{items: items, next_cursor: next_cursor}}
+      end
+    end
+  end
+
+  def list_range(_, _, _), do: {:error, :invalid_args}
 
   def txn(compare, success, failure \\ [])
 
@@ -320,7 +342,7 @@ defmodule Toska.KVStore do
 
   @impl true
   def init(_opts) do
-    ensure_table()
+    ensure_tables()
     config = load_config()
 
     File.mkdir_p!(config.data_dir)
@@ -603,7 +625,7 @@ defmodule Toska.KVStore do
         {:reply, {:error, :invalid_checksum}, state}
 
       true ->
-        :ets.delete_all_objects(@table)
+        delete_all_entries()
         now = now_ms()
         load_entries(data, now)
         leases = load_leases(Map.get(payload, "leases"), now)
@@ -730,11 +752,9 @@ defmodule Toska.KVStore do
 
   # Internal helpers
 
-  defp ensure_table do
-    case :ets.whereis(@table) do
-      :undefined -> :ok
-      tid -> :ets.delete(tid)
-    end
+  defp ensure_tables do
+    delete_table(@table)
+    delete_table(@key_index_table)
 
     :ets.new(@table, [
       :named_table,
@@ -743,6 +763,29 @@ defmodule Toska.KVStore do
       read_concurrency: true,
       write_concurrency: true
     ])
+
+    :ets.new(@key_index_table, [
+      :named_table,
+      :ordered_set,
+      :public,
+      read_concurrency: true,
+      write_concurrency: true
+    ])
+  end
+
+  defp delete_table(table) do
+    case :ets.whereis(table) do
+      :undefined -> :ok
+      tid -> :ets.delete(tid)
+    end
+  end
+
+  defp ensure_read_tables do
+    case {:ets.whereis(@table), :ets.whereis(@key_index_table)} do
+      {:undefined, _} -> {:error, :not_running}
+      {_, :undefined} -> {:error, :not_running}
+      _ -> :ok
+    end
   end
 
   defp lookup_entry(key, now) do
@@ -810,6 +853,18 @@ defmodule Toska.KVStore do
       {entry.key, entry.value, entry.expires_at, entry.version, entry.created_at,
        entry.updated_at, entry.lease_id}
     )
+
+    :ets.insert(@key_index_table, {entry.key})
+  end
+
+  defp delete_stored_entry(key) do
+    :ets.delete(@table, key)
+    :ets.delete(@key_index_table, key)
+  end
+
+  defp delete_all_entries do
+    :ets.delete_all_objects(@table)
+    :ets.delete_all_objects(@key_index_table)
   end
 
   defp set_record(entry, revision) do
@@ -1190,7 +1245,7 @@ defmodule Toska.KVStore do
     revision = next_revision(state)
     aof_op = if event_op == "expire", do: "expire", else: "del"
 
-    :ets.delete(@table, key)
+    delete_stored_entry(key)
     append_aof(state, %{op: aof_op, key: key, revision: revision})
 
     state
@@ -1634,6 +1689,47 @@ defmodule Toska.KVStore do
 
   # Cursor-based key collection helpers
 
+  defp normalize_range_options(opts) do
+    with {:ok, opts} <- normalize_options_map(opts),
+         {:ok, cursor} <- normalize_range_cursor(condition_value(opts, :cursor)),
+         {:ok, start} <- normalize_range_start(condition_value(opts, :start)),
+         {:ok, include_values} <- normalize_range_bool(condition_value(opts, :include_values)),
+         {:ok, include_metadata} <- normalize_range_bool(condition_value(opts, :include_metadata)) do
+      {:ok,
+       %{
+         cursor: cursor,
+         start: start,
+         include_values: include_values,
+         include_metadata: include_metadata
+       }}
+    else
+      _ -> {:error, :invalid_args}
+    end
+  end
+
+  defp normalize_range_cursor(nil), do: {:ok, nil}
+  defp normalize_range_cursor(value) when is_binary(value), do: {:ok, value}
+  defp normalize_range_cursor(_value), do: {:error, :invalid_args}
+
+  defp normalize_range_start(nil), do: {:ok, nil}
+  defp normalize_range_start(value) when is_binary(value), do: {:ok, value}
+  defp normalize_range_start(_value), do: {:error, :invalid_args}
+
+  defp normalize_range_bool(nil), do: {:ok, false}
+  defp normalize_range_bool(value) when is_boolean(value), do: {:ok, value}
+
+  defp normalize_range_bool(value) when is_binary(value) do
+    case String.downcase(value) do
+      "true" -> {:ok, true}
+      "1" -> {:ok, true}
+      "false" -> {:ok, false}
+      "0" -> {:ok, false}
+      _ -> {:error, :invalid_args}
+    end
+  end
+
+  defp normalize_range_bool(_value), do: {:error, :invalid_args}
+
   defp decode_cursor_key(nil, _prefix), do: {:ok, nil}
   defp decode_cursor_key("", _prefix), do: {:ok, nil}
 
@@ -1645,53 +1741,81 @@ defmodule Toska.KVStore do
     end
   end
 
-  defp collect_keys_after(prefix, start_key, limit, now, _chunk_size) do
-    # Collect all matching keys, sort them, then paginate
-    # This is necessary because ETS doesn't iterate in sorted order,
-    # so cursor-based pagination requires sorting first
-    all_keys = collect_all_matching_keys(prefix, now)
+  defp range_start(_prefix, _start, cursor_key) when is_binary(cursor_key) do
+    {:exclusive, cursor_key}
+  end
 
-    # Sort keys for consistent pagination
-    sorted_keys = Enum.sort(all_keys)
-
-    # Filter to keys after cursor
-    filtered_keys =
-      case start_key do
-        nil -> sorted_keys
-        key -> Enum.filter(sorted_keys, &(&1 > key))
+  defp range_start(prefix, start, nil) do
+    lower_bound =
+      cond do
+        is_nil(start) and prefix == "" -> nil
+        is_nil(start) -> prefix
+        prefix == "" -> start
+        start > prefix -> start
+        true -> prefix
       end
 
-    # Take limit+1 to detect if there are more
-    taken = Enum.take(filtered_keys, limit + 1)
+    {:inclusive, lower_bound}
+  end
 
-    if length(taken) > limit do
-      {Enum.take(taken, limit), true}
+  defp collect_range_entries(prefix, start, limit, now) do
+    first_key =
+      case start do
+        {:exclusive, key} -> :ets.next(@key_index_table, key)
+        {:inclusive, nil} -> :ets.first(@key_index_table)
+        {:inclusive, key} -> first_key_at_or_after(key)
+      end
+
+    entries = collect_range_from(first_key, prefix, limit + 1, now, [])
+
+    if length(entries) > limit do
+      {Enum.take(entries, limit), true}
     else
-      {taken, false}
+      {entries, false}
     end
   end
 
-  defp collect_all_matching_keys(prefix, now) do
-    @table
-    |> :ets.tab2list()
-    |> Enum.reduce([], fn tuple, acc ->
-      case entry_from_tuple(tuple, now) do
-        nil ->
-          acc
+  defp first_key_at_or_after(key) do
+    case :ets.lookup(@key_index_table, key) do
+      [{^key}] -> key
+      _ -> :ets.next(@key_index_table, key)
+    end
+  end
 
-        entry ->
-          cond do
-            expired?(entry.expires_at, now) ->
-              acc
+  defp collect_range_from(:"$end_of_table", _prefix, _remaining, _now, acc) do
+    Enum.reverse(acc)
+  end
 
-            not matches_prefix?(entry.key, prefix) ->
-              acc
+  defp collect_range_from(_key, _prefix, 0, _now, acc) do
+    Enum.reverse(acc)
+  end
 
-            true ->
-              [entry.key | acc]
-          end
+  defp collect_range_from(key, prefix, remaining, now, acc) do
+    if not matches_prefix?(key, prefix) do
+      Enum.reverse(acc)
+    else
+      next_key = :ets.next(@key_index_table, key)
+
+      case current_entry(key, now) do
+        nil -> collect_range_from(next_key, prefix, remaining, now, acc)
+        entry -> collect_range_from(next_key, prefix, remaining - 1, now, [entry | acc])
       end
-    end)
+    end
+  end
+
+  defp range_item(entry, opts) do
+    %{key: entry.key}
+    |> maybe_put_range_value(entry, opts.include_values)
+    |> maybe_put_range_metadata(entry, opts.include_metadata)
+  end
+
+  defp maybe_put_range_value(item, _entry, false), do: item
+  defp maybe_put_range_value(item, entry, true), do: Map.put(item, :value, entry.value)
+
+  defp maybe_put_range_metadata(item, _entry, false), do: item
+
+  defp maybe_put_range_metadata(item, entry, true) do
+    Map.put(item, :metadata, entry_result(entry).metadata)
   end
 
   defp matches_prefix?(_key, ""), do: true
@@ -2062,7 +2186,7 @@ defmodule Toska.KVStore do
       case entry_from_tuple(tuple, now) do
         %{lease_id: lease_id, key: key} when not is_nil(lease_id) ->
           if is_nil(active_lease(leases, lease_id, now)) do
-            :ets.delete(@table, key)
+            delete_stored_entry(key)
           end
 
         _ ->
@@ -2199,11 +2323,11 @@ defmodule Toska.KVStore do
   end
 
   defp apply_aof_record(%{"op" => "del", "key" => key}, _now) do
-    :ets.delete(@table, key)
+    delete_stored_entry(key)
   end
 
   defp apply_aof_record(%{"op" => "expire", "key" => key}, _now) do
-    :ets.delete(@table, key)
+    delete_stored_entry(key)
   end
 
   defp apply_aof_record(_record, _now), do: :ok

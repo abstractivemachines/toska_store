@@ -491,6 +491,84 @@ defmodule Toska.KVStoreTest do
     end
   end
 
+  describe "list_range/3" do
+    test "returns lexicographic range pages with stable cursors" do
+      for key <- ["range:03", "range:01", "other:01", "range:02", "range:04"] do
+        :ok = Toska.KVStore.put(key, key)
+      end
+
+      assert {:ok, page1} = Toska.KVStore.list_range("range:", 2)
+      assert Enum.map(page1.items, & &1.key) == ["range:01", "range:02"]
+      assert page1.next_cursor != nil
+
+      assert {:ok, page2} = Toska.KVStore.list_range("range:", 2, cursor: page1.next_cursor)
+      assert Enum.map(page2.items, & &1.key) == ["range:03", "range:04"]
+      assert page2.next_cursor == nil
+    end
+
+    test "honors an inclusive start lower bound" do
+      for i <- 1..5 do
+        key = "start:#{i}"
+        :ok = Toska.KVStore.put(key, to_string(i))
+      end
+
+      assert {:ok, result} = Toska.KVStore.list_range("start:", 10, start: "start:3")
+      assert Enum.map(result.items, & &1.key) == ["start:3", "start:4", "start:5"]
+    end
+
+    test "can include values and metadata in range items" do
+      assert {:ok, lease} = Toska.KVStore.create_lease(5_000, id: "range-lease")
+      assert :ok = Toska.KVStore.put("rich:1", "one", nil, lease_id: lease.id)
+
+      assert {:ok, result} =
+               Toska.KVStore.list_range("rich:", 10,
+                 include_values: true,
+                 include_metadata: true
+               )
+
+      assert [
+               %{
+                 key: "rich:1",
+                 value: "one",
+                 metadata: metadata
+               }
+             ] = result.items
+
+      assert metadata.version == 1
+      assert metadata.lease_id == lease.id
+      assert metadata.expires_at == lease.expires_at
+    end
+
+    test "drops deleted and expired keys from the ordered index scan" do
+      assert :ok = Toska.KVStore.put("idx:delete", "gone")
+      assert :ok = Toska.KVStore.delete("idx:delete")
+      assert :ok = Toska.KVStore.put("idx:expire", "gone", 5)
+      assert :ok = Toska.KVStore.put("idx:keep", "ok")
+
+      :timer.sleep(10)
+
+      assert {:ok, result} = Toska.KVStore.list_range("idx:", 10)
+      assert Enum.map(result.items, & &1.key) == ["idx:keep"]
+    end
+
+    test "rebuilds the ordered index from AOF on restart" do
+      assert :ok = Toska.KVStore.put("reindex:b", "2")
+      assert :ok = Toska.KVStore.put("reindex:a", "1")
+
+      stop_store()
+      start_store()
+
+      assert {:ok, result} = Toska.KVStore.list_range("reindex:", 10)
+      assert Enum.map(result.items, & &1.key) == ["reindex:a", "reindex:b"]
+    end
+
+    test "validates range options" do
+      assert {:error, :invalid_args} = Toska.KVStore.list_range("", 10, start: 123)
+      assert {:error, :invalid_args} = Toska.KVStore.list_range("", 10, include_values: "yes")
+      assert {:error, :invalid_cursor} = Toska.KVStore.list_range("", 10, cursor: "bad!!!")
+    end
+  end
+
   test "replace_snapshot validates payload" do
     assert {:error, :invalid_snapshot} = Toska.KVStore.replace_snapshot("nope")
 

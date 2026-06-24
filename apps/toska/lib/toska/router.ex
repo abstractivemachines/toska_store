@@ -88,6 +88,7 @@ defmodule Toska.Router do
         <li><a href="/status">/status</a> - JSON status endpoint</li>
         <li><a href="/health">/health</a> - Health check endpoint</li>
         <li><a href="/stats">/stats</a> - KV store stats</li>
+        <li>/kv?prefix=&amp;start=&amp;limit=&amp;cursor= - Range scan keys with optional values/metadata</li>
         <li>/kv/&lt;key&gt; - GET/PUT/DELETE key/value</li>
         <li>/kv/mget - POST body {"keys": ["a", "b"]}</li>
         <li>/kv/watch?prefix=&amp;since_revision=0 - Server-Sent Events key change feed</li>
@@ -411,6 +412,53 @@ defmodule Toska.Router do
         conn
         |> put_resp_content_type("application/json")
         |> send_resp(400, Jason.encode!(%{error: "Invalid transaction"}))
+
+      {:error, reason} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)})
+        )
+    end
+  end
+
+  # GET /kv?prefix=...&start=...&limit=...&cursor=... - range scan
+  get "/kv" do
+    prefix = conn.params["prefix"] || ""
+
+    opts = [
+      cursor: conn.params["cursor"],
+      start: conn.params["start"],
+      include_values: conn.params["include_values"],
+      include_metadata: conn.params["include_metadata"]
+    ]
+
+    with {:ok, limit} <- parse_key_list_limit(conn.params["limit"]),
+         {:ok, result} <- Toska.KVStore.list_range(prefix, limit, opts) do
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(200, Jason.encode!(result))
+    else
+      {:error, :invalid_limit} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(400, Jason.encode!(%{error: "Invalid limit"}))
+
+      {:error, :limit_too_large} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(400, Jason.encode!(%{error: "Limit too large", max: @max_key_list_limit}))
+
+      {:error, :invalid_cursor} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(400, Jason.encode!(%{error: "Invalid cursor"}))
+
+      {:error, :invalid_args} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(400, Jason.encode!(%{error: "Invalid range parameters"}))
 
       {:error, reason} ->
         conn
