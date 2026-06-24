@@ -170,6 +170,7 @@ When the server is running, the HTTP API provides a simple JSON key/value store:
 - `PUT /kv/:key` - Set a value with optional `ttl_ms` (`{"value": "...", "ttl_ms": 5000}`)
 - `DELETE /kv/:key` - Remove a key
 - `POST /kv/mget` - Fetch multiple keys (`{"keys": ["a", "b"]}`)
+- `POST /kv/txn` - Atomically compare keys and apply a success or failure operation list
 - `GET /stats` - Store metrics and persistence info
 - `GET /replication/info` - Snapshot + AOF metadata for followers
 - `GET /replication/snapshot` - JSON snapshot file
@@ -182,6 +183,11 @@ When follower mode is enabled, KV write endpoints (`PUT`/`DELETE`) return `403` 
 KV endpoints (`/kv/*` and `/stats`) can require an auth token and apply rate limits:
 - `auth_token` (or `TOSKA_AUTH_TOKEN`) expects `Authorization: Bearer <token>` or `X-Toska-Token`.
 - `rate_limit_per_sec` + `rate_limit_burst` (or `TOSKA_RATE_LIMIT_PER_SEC`, `TOSKA_RATE_LIMIT_BURST`).
+
+`GET /kv/:key` returns `value` plus metadata (`version`, `created_at`, `updated_at`, `expires_at`) and sets an `ETag` matching the current version.
+`PUT /kv/:key` accepts optional `if_version`, `if_absent`, and `if_present` fields. `DELETE /kv/:key` accepts `if_version` as a query parameter. `PUT` and `DELETE` also accept `If-Match: "<version>"`; failed conditions return `412`.
+
+`POST /kv/txn` accepts `compare`, `success`, and `failure` arrays. Compares support `version`, `exists`, and `value`; operations support `put`, `delete`, and `get`. The selected operation list runs atomically inside the KV store.
 
 `GET /kv/keys` returns `{"keys": [...], "next_cursor": "..."}`. When `next_cursor` is present, pass it back as `cursor` with the same `prefix` to fetch the next page. `limit` defaults to `100`, may be `0`, and cannot exceed `1000`.
 

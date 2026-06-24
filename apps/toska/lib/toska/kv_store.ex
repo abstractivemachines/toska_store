@@ -32,25 +32,52 @@ defmodule Toska.KVStore do
         {:error, :not_running}
 
       _ ->
-        lookup_key(key, now_ms())
+        case lookup_entry(key, now_ms()) do
+          {:ok, entry} -> {:ok, entry.value}
+          {:error, reason} -> {:error, reason}
+        end
     end
   end
 
   def get(_), do: {:error, :invalid_key}
 
+  def get_entry(key) when is_binary(key) do
+    case :ets.whereis(@table) do
+      :undefined ->
+        {:error, :not_running}
+
+      _ ->
+        lookup_entry(key, now_ms())
+    end
+  end
+
+  def get_entry(_), do: {:error, :invalid_key}
+
   def put(key, value, ttl_ms \\ nil)
 
   def put(key, value, ttl_ms) when is_binary(key) and is_binary(value) do
-    call_store({:put, key, value, ttl_ms})
+    put(key, value, ttl_ms, [])
   end
 
   def put(_, _, _), do: {:error, :invalid_payload}
 
-  def delete(key) when is_binary(key) do
-    call_store({:delete, key})
+  def put(key, value, ttl_ms, opts) when is_binary(key) and is_binary(value) do
+    with {:ok, conditions} <- normalize_conditions(opts) do
+      call_store({:put, key, value, ttl_ms, conditions})
+    end
   end
 
-  def delete(_), do: {:error, :invalid_key}
+  def put(_, _, _, _), do: {:error, :invalid_payload}
+
+  def delete(key, opts \\ [])
+
+  def delete(key, opts) when is_binary(key) do
+    with {:ok, conditions} <- normalize_conditions(opts) do
+      call_store({:delete, key, conditions})
+    end
+  end
+
+  def delete(_, _), do: {:error, :invalid_key}
 
   def mget(keys) when is_list(keys) do
     case :ets.whereis(@table) do
@@ -65,8 +92,8 @@ defmodule Toska.KVStore do
           |> Enum.map(fn key ->
             case key do
               k when is_binary(k) ->
-                case lookup_key(k, now) do
-                  {:ok, value} -> {k, value}
+                case lookup_entry(k, now) do
+                  {:ok, entry} -> {k, entry.value}
                   _ -> {k, nil}
                 end
 
@@ -150,6 +177,17 @@ defmodule Toska.KVStore do
   end
 
   def list_keys_cursor(_, _, _), do: {:error, :invalid_args}
+
+  def txn(compare, success, failure \\ [])
+
+  def txn(compare, success, failure)
+      when is_list(compare) and is_list(success) and is_list(failure) do
+    with {:ok, txn} <- normalize_txn(compare, success, failure) do
+      call_store({:txn, txn})
+    end
+  end
+
+  def txn(_, _, _), do: {:error, :invalid_transaction}
 
   def stats do
     case GenServer.whereis(__MODULE__) do
@@ -248,25 +286,48 @@ defmodule Toska.KVStore do
   end
 
   @impl true
-  def handle_call({:put, key, value, ttl_ms}, _from, state) do
+  def handle_call({:put, key, value, ttl_ms, conditions}, _from, state) do
     now = now_ms()
     expires_at = normalize_ttl(ttl_ms, now)
+    current = current_entry(key, now)
 
-    if expires_at == :expired do
+    if conditions_met?(current, conditions) do
+      if expires_at == :expired do
+        :ets.delete(@table, key)
+        append_aof(state, %{op: "del", key: key})
+        {:reply, :ok, maybe_sync(state)}
+      else
+        entry = next_entry(key, value, expires_at, current, now)
+        insert_entry(entry)
+        append_aof(state, set_record(entry))
+        {:reply, :ok, maybe_sync(state)}
+      end
+    else
+      {:reply, {:error, :condition_failed}, state}
+    end
+  end
+
+  def handle_call({:delete, key, conditions}, _from, state) do
+    now = now_ms()
+    current = current_entry(key, now)
+
+    if conditions_met?(current, conditions) do
       :ets.delete(@table, key)
       append_aof(state, %{op: "del", key: key})
       {:reply, :ok, maybe_sync(state)}
     else
-      :ets.insert(@table, {key, value, expires_at})
-      append_aof(state, %{op: "set", key: key, value: value, expires_at: expires_at})
-      {:reply, :ok, maybe_sync(state)}
+      {:reply, {:error, :condition_failed}, state}
     end
   end
 
-  def handle_call({:delete, key}, _from, state) do
-    :ets.delete(@table, key)
-    append_aof(state, %{op: "del", key: key})
-    {:reply, :ok, maybe_sync(state)}
+  def handle_call({:txn, txn}, _from, state) do
+    now = now_ms()
+    succeeded = Enum.all?(txn.compare, &compare_met?(&1, now))
+    ops = if succeeded, do: txn.success, else: txn.failure
+    {responses, wrote?} = apply_txn_ops(ops, state, now)
+    state = if wrote?, do: maybe_sync(state), else: state
+
+    {:reply, {:ok, %{succeeded: succeeded, responses: responses}}, state}
   end
 
   def handle_call(:stats, _from, state) do
@@ -446,19 +507,73 @@ defmodule Toska.KVStore do
     ])
   end
 
-  defp lookup_key(key, now) do
+  defp lookup_entry(key, now) do
     case :ets.lookup(@table, key) do
+      [{^key, value, expires_at, version, created_at, updated_at}] ->
+        if expired?(expires_at, now) do
+          :ets.delete(@table, key)
+          {:error, :not_found}
+        else
+          {:ok, entry(key, value, expires_at, version, created_at, updated_at)}
+        end
+
       [{^key, value, expires_at}] ->
         if expired?(expires_at, now) do
           :ets.delete(@table, key)
           {:error, :not_found}
         else
-          {:ok, value}
+          {:ok, entry(key, value, expires_at, 1, now, now)}
         end
 
       _ ->
         {:error, :not_found}
     end
+  end
+
+  defp current_entry(key, now) do
+    case lookup_entry(key, now) do
+      {:ok, entry} -> entry
+      {:error, :not_found} -> nil
+    end
+  end
+
+  defp entry(key, value, expires_at, version, created_at, updated_at) do
+    %{
+      key: key,
+      value: value,
+      expires_at: expires_at,
+      version: version,
+      created_at: created_at,
+      updated_at: updated_at
+    }
+  end
+
+  defp next_entry(key, value, expires_at, nil, now) do
+    entry(key, value, expires_at, 1, now, now)
+  end
+
+  defp next_entry(key, value, expires_at, current, now) do
+    entry(key, value, expires_at, current.version + 1, current.created_at, now)
+  end
+
+  defp insert_entry(entry) do
+    :ets.insert(
+      @table,
+      {entry.key, entry.value, entry.expires_at, entry.version, entry.created_at,
+       entry.updated_at}
+    )
+  end
+
+  defp set_record(entry) do
+    %{
+      op: "set",
+      key: entry.key,
+      value: entry.value,
+      expires_at: entry.expires_at,
+      version: entry.version,
+      created_at: entry.created_at,
+      updated_at: entry.updated_at
+    }
   end
 
   defp expired?(nil, _now), do: false
@@ -484,10 +599,271 @@ defmodule Toska.KVStore do
 
   defp normalize_ttl(_ttl_ms, _now), do: nil
 
+  defp normalize_conditions(nil), do: {:ok, default_conditions()}
+
+  defp normalize_conditions(opts) when is_list(opts) do
+    try do
+      opts
+      |> Map.new()
+      |> normalize_conditions()
+    rescue
+      _ -> {:error, :invalid_conditions}
+    end
+  end
+
+  defp normalize_conditions(opts) when is_map(opts) do
+    with {:ok, if_absent} <- normalize_bool(condition_value(opts, :if_absent)),
+         {:ok, if_present} <- normalize_bool(condition_value(opts, :if_present)),
+         {:ok, if_version} <- normalize_version(condition_value(opts, :if_version)) do
+      cond do
+        if_absent and if_present ->
+          {:error, :invalid_conditions}
+
+        if_absent and not is_nil(if_version) ->
+          {:error, :invalid_conditions}
+
+        true ->
+          {:ok,
+           %{
+             if_absent: if_absent,
+             if_present: if_present,
+             if_version: if_version
+           }}
+      end
+    end
+  end
+
+  defp normalize_conditions(_), do: {:error, :invalid_conditions}
+
+  defp default_conditions do
+    %{if_absent: false, if_present: false, if_version: nil}
+  end
+
+  defp condition_value(opts, key) do
+    if Map.has_key?(opts, key) do
+      Map.get(opts, key)
+    else
+      Map.get(opts, to_string(key))
+    end
+  end
+
+  defp normalize_bool(nil), do: {:ok, false}
+  defp normalize_bool(value) when is_boolean(value), do: {:ok, value}
+
+  defp normalize_bool(value) when is_binary(value) do
+    case String.downcase(value) do
+      "true" -> {:ok, true}
+      "false" -> {:ok, false}
+      _ -> {:error, :invalid_conditions}
+    end
+  end
+
+  defp normalize_bool(_), do: {:error, :invalid_conditions}
+
+  defp normalize_version(nil), do: {:ok, nil}
+  defp normalize_version(value) when is_integer(value) and value > 0, do: {:ok, value}
+
+  defp normalize_version(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} when int > 0 -> {:ok, int}
+      _ -> {:error, :invalid_conditions}
+    end
+  end
+
+  defp normalize_version(_), do: {:error, :invalid_conditions}
+
+  defp conditions_met?(current, conditions) do
+    absent_ok = not conditions.if_absent or is_nil(current)
+    present_ok = not conditions.if_present or not is_nil(current)
+
+    version_ok =
+      is_nil(conditions.if_version) ||
+        (not is_nil(current) and current.version == conditions.if_version)
+
+    absent_ok and present_ok and version_ok
+  end
+
+  defp normalize_txn(compare, success, failure) do
+    with {:ok, compare} <- normalize_compare_list(compare),
+         {:ok, success} <- normalize_txn_ops(success),
+         {:ok, failure} <- normalize_txn_ops(failure) do
+      {:ok, %{compare: compare, success: success, failure: failure}}
+    else
+      _ -> {:error, :invalid_transaction}
+    end
+  end
+
+  defp normalize_compare_list(compares) do
+    normalize_list(compares, &normalize_compare/1)
+  end
+
+  defp normalize_txn_ops(ops) do
+    normalize_list(ops, &normalize_txn_op/1)
+  end
+
+  defp normalize_list(items, normalizer) do
+    items
+    |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
+      case normalizer.(item) do
+        {:ok, value} -> {:cont, {:ok, [value | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, values} -> {:ok, Enum.reverse(values)}
+      error -> error
+    end
+  end
+
+  defp normalize_compare(compare) when is_map(compare) do
+    key = condition_value(compare, :key)
+    version = condition_value(compare, :version)
+    exists = condition_value(compare, :exists)
+    value = condition_value(compare, :value)
+
+    with true <- is_binary(key),
+         {:ok, version} <- normalize_version(version),
+         {:ok, exists} <- normalize_optional_bool(exists),
+         {:ok, value} <- normalize_optional_value(value),
+         true <- not (is_nil(version) and is_nil(exists) and is_nil(value)) do
+      {:ok, %{key: key, version: version, exists: exists, value: value}}
+    else
+      _ -> {:error, :invalid_transaction}
+    end
+  end
+
+  defp normalize_compare(_), do: {:error, :invalid_transaction}
+
+  defp normalize_txn_op(op) when is_map(op) do
+    case normalize_op_name(condition_value(op, :op)) do
+      :put -> normalize_put_op(op)
+      :delete -> normalize_key_op(op, :delete)
+      :get -> normalize_key_op(op, :get)
+      nil -> {:error, :invalid_transaction}
+    end
+  end
+
+  defp normalize_txn_op(_), do: {:error, :invalid_transaction}
+
+  defp normalize_op_name(op) when is_atom(op), do: normalize_op_name(Atom.to_string(op))
+
+  defp normalize_op_name(op) when is_binary(op) do
+    case String.downcase(op) do
+      "put" -> :put
+      "set" -> :put
+      "delete" -> :delete
+      "del" -> :delete
+      "get" -> :get
+      _ -> nil
+    end
+  end
+
+  defp normalize_op_name(_), do: nil
+
+  defp normalize_put_op(op) do
+    key = condition_value(op, :key)
+    value = condition_value(op, :value)
+
+    if is_binary(key) and is_binary(value) do
+      {:ok, %{op: :put, key: key, value: value, ttl_ms: condition_value(op, :ttl_ms)}}
+    else
+      {:error, :invalid_transaction}
+    end
+  end
+
+  defp normalize_key_op(op, name) do
+    key = condition_value(op, :key)
+
+    if is_binary(key) do
+      {:ok, %{op: name, key: key}}
+    else
+      {:error, :invalid_transaction}
+    end
+  end
+
+  defp normalize_optional_bool(nil), do: {:ok, nil}
+
+  defp normalize_optional_bool(value) do
+    case normalize_bool(value) do
+      {:ok, bool} -> {:ok, bool}
+      {:error, _} -> {:error, :invalid_transaction}
+    end
+  end
+
+  defp normalize_optional_value(nil), do: {:ok, nil}
+  defp normalize_optional_value(value) when is_binary(value), do: {:ok, value}
+  defp normalize_optional_value(_), do: {:error, :invalid_transaction}
+
+  defp compare_met?(compare, now) do
+    current = current_entry(compare.key, now)
+
+    version_ok =
+      is_nil(compare.version) ||
+        (not is_nil(current) and current.version == compare.version)
+
+    exists_ok =
+      is_nil(compare.exists) ||
+        not is_nil(current) == compare.exists
+
+    value_ok =
+      is_nil(compare.value) ||
+        (not is_nil(current) and current.value == compare.value)
+
+    version_ok and exists_ok and value_ok
+  end
+
+  defp apply_txn_ops(ops, state, now) do
+    Enum.map_reduce(ops, false, fn op, wrote? ->
+      {result, op_wrote?} = apply_txn_op(op, state, now)
+      {result, wrote? or op_wrote?}
+    end)
+  end
+
+  defp apply_txn_op(%{op: :put} = op, state, now) do
+    expires_at = normalize_ttl(op.ttl_ms, now)
+
+    if expires_at == :expired do
+      :ets.delete(@table, op.key)
+      append_aof(state, %{op: "del", key: op.key})
+      {%{op: "put", key: op.key, deleted: true}, true}
+    else
+      entry = next_entry(op.key, op.value, expires_at, current_entry(op.key, now), now)
+      insert_entry(entry)
+      append_aof(state, set_record(entry))
+      {Map.put(entry_result(entry), :op, "put"), true}
+    end
+  end
+
+  defp apply_txn_op(%{op: :delete, key: key}, state, _now) do
+    :ets.delete(@table, key)
+    append_aof(state, %{op: "del", key: key})
+    {%{op: "delete", key: key, deleted: true}, true}
+  end
+
+  defp apply_txn_op(%{op: :get, key: key}, _state, now) do
+    case current_entry(key, now) do
+      nil -> {%{op: "get", key: key, found: false, value: nil}, false}
+      entry -> {entry |> entry_result() |> Map.put(:op, "get") |> Map.put(:found, true), false}
+    end
+  end
+
+  defp entry_result(entry) do
+    %{
+      key: entry.key,
+      value: entry.value,
+      metadata: %{
+        version: entry.version,
+        created_at: entry.created_at,
+        updated_at: entry.updated_at,
+        expires_at: entry.expires_at
+      }
+    }
+  end
+
   defp cleanup_expired(now) do
     match_spec = [
       {
-        {:"$1", :"$2", :"$3"},
+        {:"$1", :"$2", :"$3", :"$4", :"$5", :"$6"},
         [{:is_integer, :"$3"}, {:"=<", :"$3", now}],
         [:"$1"]
       }
@@ -541,11 +917,15 @@ defmodule Toska.KVStore do
           expires_at = Map.get(map, "expires_at")
 
           unless expired?(expires_at, now) do
-            :ets.insert(@table, {key, value, expires_at})
+            version = normalize_stored_version(Map.get(map, "version"))
+            created_at = normalize_stored_timestamp(Map.get(map, "created_at"), now)
+            updated_at = normalize_stored_timestamp(Map.get(map, "updated_at"), created_at)
+
+            insert_entry(entry(key, value, expires_at, version, created_at, updated_at))
           end
 
         value when is_binary(value) ->
-          :ets.insert(@table, {key, value, nil})
+          insert_entry(entry(key, value, nil, 1, now, now))
 
         _ ->
           :ok
@@ -626,7 +1006,7 @@ defmodule Toska.KVStore do
   end
 
   defp collect_all_matching_keys(prefix, now) do
-    match_spec = [{{:"$1", :_, :"$2"}, [], [{{:"$1", :"$2"}}]}]
+    match_spec = [{{:"$1", :_, :"$2", :_, :_, :_}, [], [{{:"$1", :"$2"}}]}]
 
     case :ets.select(@table, match_spec, 1000) do
       :"$end_of_table" ->
@@ -688,11 +1068,17 @@ defmodule Toska.KVStore do
 
     data =
       :ets.tab2list(@table)
-      |> Enum.reduce(%{}, fn {key, value, expires_at}, acc ->
+      |> Enum.reduce(%{}, fn {key, value, expires_at, version, created_at, updated_at}, acc ->
         if expired?(expires_at, now) do
           acc
         else
-          Map.put(acc, key, %{"value" => value, "expires_at" => expires_at})
+          Map.put(acc, key, %{
+            "value" => value,
+            "expires_at" => expires_at,
+            "version" => version,
+            "created_at" => created_at,
+            "updated_at" => updated_at
+          })
         end
       end)
 
@@ -881,11 +1267,39 @@ defmodule Toska.KVStore do
     System.system_time(:millisecond)
   end
 
+  defp normalize_stored_version(value) when is_integer(value) and value > 0, do: value
+
+  defp normalize_stored_version(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} when int > 0 -> int
+      _ -> 1
+    end
+  end
+
+  defp normalize_stored_version(_), do: 1
+
+  defp normalize_stored_timestamp(value, _default) when is_integer(value) and value > 0, do: value
+  defp normalize_stored_timestamp(_value, default), do: default
+
   defp apply_aof_record(%{"op" => "set", "key" => key, "value" => value} = record, now) do
     expires_at = Map.get(record, "expires_at")
 
     unless expired?(expires_at, now) do
-      :ets.insert(@table, {key, value, expires_at})
+      entry =
+        if Map.has_key?(record, "version") do
+          entry(
+            key,
+            value,
+            expires_at,
+            normalize_stored_version(Map.get(record, "version")),
+            normalize_stored_timestamp(Map.get(record, "created_at"), now),
+            normalize_stored_timestamp(Map.get(record, "updated_at"), now)
+          )
+        else
+          next_entry(key, value, expires_at, current_entry(key, now), now)
+        end
+
+      insert_entry(entry)
     end
   end
 

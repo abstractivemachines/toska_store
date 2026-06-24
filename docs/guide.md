@@ -193,6 +193,7 @@ When the server is running, the HTTP API provides a simple JSON key/value store:
 - `PUT /kv/:key` - Set a value with optional `ttl_ms` (`{"value": "...", "ttl_ms": 5000}`)
 - `DELETE /kv/:key` - Remove a key
 - `POST /kv/mget` - Fetch multiple keys (`{"keys": ["a", "b"]}`)
+- `POST /kv/txn` - Atomically compare keys and apply a success or failure operation list
 - `GET /stats` - Store metrics and persistence info
 - `GET /replication/info` - Snapshot + AOF metadata for followers
 - `GET /replication/snapshot` - JSON snapshot file
@@ -205,6 +206,71 @@ When follower mode is enabled, KV write endpoints (`PUT`/`DELETE`) return `403` 
 KV endpoints (`/kv/*` and `/stats`) can require an auth token and apply rate limits:
 - `auth_token` (or `TOSKA_AUTH_TOKEN`) expects `Authorization: Bearer <token>` or `X-Toska-Token`.
 - `rate_limit_per_sec` + `rate_limit_burst` (or `TOSKA_RATE_LIMIT_PER_SEC`, `TOSKA_RATE_LIMIT_BURST`).
+
+### Key Metadata and Conditions
+
+`GET /kv/:key` returns the value plus metadata and sets an `ETag` with the current key version.
+
+```json
+{
+  "key": "todo:1",
+  "value": "ship",
+  "metadata": {
+    "version": 1,
+    "created_at": 1782269800000,
+    "updated_at": 1782269800000,
+    "expires_at": null
+  }
+}
+```
+
+Use conditional writes to avoid stale updates:
+
+```bash
+curl -s -X PUT http://localhost:4000/kv/todo:1 \
+  -H 'content-type: application/json' \
+  -H 'if-match: "1"' \
+  -d '{"value":"ship it"}'
+```
+
+`PUT /kv/:key` accepts optional `if_version`, `if_absent`, and `if_present` fields. `DELETE /kv/:key` accepts `if_version` as a query parameter. Both write endpoints also accept `If-Match: "<version>"`. Failed conditions return `412`.
+
+### Transactions
+
+`POST /kv/txn` evaluates all compares atomically inside the KV store. If every compare passes, ToskaStore applies the `success` operation list; otherwise it applies the `failure` operation list.
+
+```bash
+curl -s -X POST http://localhost:4000/kv/txn \
+  -H 'content-type: application/json' \
+  -d '{
+    "compare": [{"key":"todo:1","version":1}],
+    "success": [{"op":"put","key":"todo:1","value":"ship it"}],
+    "failure": [{"op":"get","key":"todo:1"}]
+  }'
+```
+
+Response:
+
+```json
+{
+  "succeeded": true,
+  "responses": [
+    {
+      "op": "put",
+      "key": "todo:1",
+      "value": "ship it",
+      "metadata": {
+        "version": 2,
+        "created_at": 1782269800000,
+        "updated_at": 1782269810000,
+        "expires_at": null
+      }
+    }
+  ]
+}
+```
+
+Compares support `version`, `exists`, and `value`. Operations support `put`, `delete`, and `get`. Invalid transaction payloads return `400`.
 
 ### Key Listing
 
