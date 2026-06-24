@@ -85,25 +85,9 @@ defmodule Toska.KVStore do
   def list_keys(prefix \\ "", limit \\ 100)
 
   def list_keys(prefix, limit) when is_binary(prefix) and is_integer(limit) and limit >= 0 do
-    case :ets.whereis(@table) do
-      :undefined ->
-        {:error, :not_running}
-
-      _ ->
-        if limit == 0 do
-          {:ok, []}
-        else
-          now = now_ms()
-          match_spec = [{{:"$1", :_, :"$2"}, [], [{{:"$1", :"$2"}}]}]
-          chunk_size = max(min(limit, 1000), 100)
-
-          keys =
-            match_spec
-            |> collect_keys(prefix, limit, now, chunk_size)
-            |> Enum.reverse()
-
-          {:ok, keys}
-        end
+    case list_keys_cursor(prefix, limit, nil) do
+      {:ok, %{keys: keys}} -> {:ok, keys}
+      other -> other
     end
   end
 
@@ -599,58 +583,6 @@ defmodule Toska.KVStore do
 
       {:error, reason} ->
         Logger.warning("Failed to read AOF: #{inspect(reason)}")
-    end
-  end
-
-  defp collect_keys(match_spec, prefix, limit, now, chunk_size) do
-    case :ets.select(@table, match_spec, chunk_size) do
-      :"$end_of_table" ->
-        []
-
-      {rows, continuation} ->
-        collect_keys_from(rows, continuation, prefix, limit, now, [], 0)
-    end
-  end
-
-  defp collect_keys_from(rows, continuation, prefix, limit, now, acc, count) do
-    {acc, count} =
-      Enum.reduce_while(rows, {acc, count}, fn {key, expires_at}, {acc, count} ->
-        if expired?(expires_at, now) do
-          :ets.delete(@table, key)
-          {:cont, {acc, count}}
-        else
-          matches_prefix = prefix == "" or String.starts_with?(key, prefix)
-
-          if matches_prefix do
-            next_count = count + 1
-            next_acc = [key | acc]
-
-            if next_count >= limit do
-              {:halt, {next_acc, next_count}}
-            else
-              {:cont, {next_acc, next_count}}
-            end
-          else
-            {:cont, {acc, count}}
-          end
-        end
-      end)
-
-    cond do
-      count >= limit ->
-        acc
-
-      continuation == :"$end_of_table" ->
-        acc
-
-      true ->
-        case :ets.select(continuation) do
-          :"$end_of_table" ->
-            acc
-
-          {next_rows, next_continuation} ->
-            collect_keys_from(next_rows, next_continuation, prefix, limit, now, acc, count)
-        end
     end
   end
 
