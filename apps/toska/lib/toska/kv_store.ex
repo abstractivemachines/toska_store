@@ -63,8 +63,8 @@ defmodule Toska.KVStore do
   def put(_, _, _), do: {:error, :invalid_payload}
 
   def put(key, value, ttl_ms, opts) when is_binary(key) and is_binary(value) do
-    with {:ok, conditions} <- normalize_conditions(opts) do
-      call_store({:put, key, value, ttl_ms, conditions})
+    with {:ok, write_opts} <- normalize_put_options(opts) do
+      call_store({:put, key, value, ttl_ms, write_opts.conditions, write_opts.lease_id})
     end
   end
 
@@ -207,6 +207,50 @@ defmodule Toska.KVStore do
 
   def unwatch(_), do: {:error, :invalid_watch}
 
+  def create_lease(ttl_ms, opts \\ []) do
+    with {:ok, ttl_ms} <- normalize_lease_ttl(ttl_ms),
+         {:ok, lease_id} <- normalize_lease_create_id(opts) do
+      call_store({:create_lease, ttl_ms, lease_id})
+    else
+      _ -> {:error, :invalid_lease}
+    end
+  end
+
+  def keepalive_lease(id) do
+    with {:ok, id} <- normalize_required_id(id) do
+      call_store({:keepalive_lease, id})
+    else
+      _ -> {:error, :invalid_lease}
+    end
+  end
+
+  def delete_lease(id) do
+    with {:ok, id} <- normalize_required_id(id) do
+      call_store({:delete_lease, id})
+    else
+      _ -> {:error, :invalid_lease}
+    end
+  end
+
+  def acquire_lock(name, lease_id, holder \\ nil) do
+    with {:ok, name} <- normalize_required_id(name),
+         {:ok, lease_id} <- normalize_required_id(lease_id),
+         {:ok, holder} <- normalize_lock_holder(holder) do
+      call_store({:acquire_lock, name, lease_id, holder})
+    else
+      _ -> {:error, :invalid_lock}
+    end
+  end
+
+  def release_lock(name, lease_id) do
+    with {:ok, name} <- normalize_required_id(name),
+         {:ok, lease_id} <- normalize_required_id(lease_id) do
+      call_store({:release_lock, name, lease_id})
+    else
+      _ -> {:error, :invalid_lock}
+    end
+  end
+
   def stats do
     case GenServer.whereis(__MODULE__) do
       nil -> {:error, :not_running}
@@ -283,7 +327,15 @@ defmodule Toska.KVStore do
 
     snapshot_meta = load_snapshot(config.snapshot_path)
     snapshot_revision = (snapshot_meta && snapshot_meta.store_revision) || 0
-    aof_meta = replay_aof(config.aof_path, snapshot_revision, config.watch_history_limit)
+
+    aof_meta =
+      replay_aof(
+        config.aof_path,
+        snapshot_revision,
+        config.watch_history_limit,
+        (snapshot_meta && snapshot_meta.leases) || %{},
+        (snapshot_meta && snapshot_meta.locks) || %{}
+      )
 
     {:ok, aof_io} = File.open(config.aof_path, [:append, :utf8])
 
@@ -296,6 +348,8 @@ defmodule Toska.KVStore do
       |> Map.put(:revision, aof_meta.revision)
       |> Map.put(:watch_events, aof_meta.events)
       |> Map.put(:watchers, %{})
+      |> Map.put(:leases, aof_meta.leases)
+      |> Map.put(:locks, aof_meta.locks)
 
     schedule_sync(state)
     schedule_snapshot(state)
@@ -308,23 +362,24 @@ defmodule Toska.KVStore do
   end
 
   @impl true
-  def handle_call({:put, key, value, ttl_ms, conditions}, _from, state) do
+  def handle_call({:put, key, value, ttl_ms, conditions, lease_id}, _from, state) do
     now = now_ms()
-    expires_at = normalize_ttl(ttl_ms, now)
     current = current_entry(key, now)
 
-    if conditions_met?(current, conditions) do
+    with true <- conditions_met?(current, conditions),
+         {:ok, expires_at} <- write_expires_at(ttl_ms, lease_id, state, now) do
       state =
         if expires_at == :expired do
           delete_entry(state, key, current, now, "delete")
         else
-          entry = next_entry(key, value, expires_at, current, now)
+          entry = next_entry(key, value, expires_at, current, now, lease_id)
           put_entry(state, entry, now)
         end
 
       {:reply, :ok, maybe_sync(state)}
     else
-      {:reply, {:error, :condition_failed}, state}
+      false -> {:reply, {:error, :condition_failed}, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
 
@@ -337,6 +392,108 @@ defmodule Toska.KVStore do
       {:reply, :ok, maybe_sync(state)}
     else
       {:reply, {:error, :condition_failed}, state}
+    end
+  end
+
+  def handle_call({:create_lease, ttl_ms, requested_id}, _from, state) do
+    now = now_ms()
+    state = drop_expired_lease_id(state, requested_id, now)
+    lease_id = requested_id || unique_lease_id(state.leases)
+
+    if active_lease(state.leases, lease_id, now) do
+      {:reply, {:error, :lease_exists}, state}
+    else
+      lease = lease(lease_id, ttl_ms, now, now + ttl_ms, now)
+
+      state =
+        state
+        |> put_lease_state(lease)
+        |> append_metadata_aof(lease_record("lease_create", lease))
+
+      {:reply, {:ok, lease_result(lease)}, maybe_sync(state)}
+    end
+  end
+
+  def handle_call({:keepalive_lease, lease_id}, _from, state) do
+    now = now_ms()
+
+    case active_lease(state.leases, lease_id, now) do
+      nil ->
+        {:reply, {:error, :lease_not_found}, state}
+
+      current ->
+        lease = %{current | expires_at: now + current.ttl_ms, updated_at: now}
+
+        state =
+          state
+          |> put_lease_state(lease)
+          |> renew_attached_locks(lease)
+          |> append_metadata_aof(lease_record("lease_keepalive", lease))
+          |> renew_attached_entries(lease, now)
+
+        {:reply, {:ok, lease_result(lease)}, maybe_sync(state)}
+    end
+  end
+
+  def handle_call({:delete_lease, lease_id}, _from, state) do
+    now = now_ms()
+
+    case active_lease(state.leases, lease_id, now) do
+      nil ->
+        {:reply, {:error, :lease_not_found}, state}
+
+      lease ->
+        state = revoke_lease(state, lease.id, now, "lease_delete", "delete")
+        {:reply, :ok, maybe_sync(state)}
+    end
+  end
+
+  def handle_call({:acquire_lock, name, lease_id, holder}, _from, state) do
+    now = now_ms()
+
+    case active_lease(state.leases, lease_id, now) do
+      nil ->
+        {:reply, {:error, :lease_not_found}, state}
+
+      lease ->
+        case active_lock(state, name, now) do
+          nil ->
+            lock = lock(name, lease.id, holder, now, lease.expires_at)
+
+            state =
+              state
+              |> put_lock_state(lock)
+              |> append_metadata_aof(lock_record("lock_acquire", lock))
+
+            {:reply, {:ok, lock_result(lock)}, maybe_sync(state)}
+
+          %{lease_id: ^lease_id} = lock ->
+            {:reply, {:ok, lock_result(lock)}, state}
+
+          _lock ->
+            {:reply, {:error, :lock_held}, state}
+        end
+    end
+  end
+
+  def handle_call({:release_lock, name, lease_id}, _from, state) do
+    now = now_ms()
+
+    case active_lock(state, name, now) do
+      nil ->
+        state = remove_lock_state(state, name)
+        {:reply, {:error, :lock_not_found}, state}
+
+      %{lease_id: ^lease_id} ->
+        state =
+          state
+          |> remove_lock_state(name)
+          |> append_metadata_aof(%{op: "lock_release", name: name})
+
+        {:reply, :ok, maybe_sync(state)}
+
+      _lock ->
+        {:reply, {:error, :lock_owner_mismatch}, state}
     end
   end
 
@@ -375,6 +532,8 @@ defmodule Toska.KVStore do
       compaction_interval_ms: state.compaction_interval_ms,
       compaction_aof_bytes: state.compaction_aof_bytes,
       revision: state.revision,
+      leases: active_lease_count(state.leases),
+      locks: active_lock_count(state.locks, state.leases),
       watch_history_size: length(state.watch_events),
       watch_history_limit: state.watch_history_limit,
       watchers: map_size(state.watchers),
@@ -445,9 +604,19 @@ defmodule Toska.KVStore do
 
       true ->
         :ets.delete_all_objects(@table)
-        load_entries(data, now_ms())
+        now = now_ms()
+        load_entries(data, now)
+        leases = load_leases(Map.get(payload, "leases"), now)
+        locks = load_locks(Map.get(payload, "locks"), leases, now)
         store_revision = snapshot_store_revision(payload, state.revision)
-        updated = %{state | revision: store_revision, watch_events: []}
+
+        updated = %{
+          state
+          | revision: store_revision,
+            watch_events: [],
+            leases: leases,
+            locks: locks
+        }
 
         case write_snapshot(updated) do
           {:ok, checksum} ->
@@ -578,18 +747,13 @@ defmodule Toska.KVStore do
 
   defp lookup_entry(key, now) do
     case :ets.lookup(@table, key) do
-      [{^key, value, expires_at, version, created_at, updated_at}] ->
-        if expired?(expires_at, now) do
-          {:error, :not_found}
-        else
-          {:ok, entry(key, value, expires_at, version, created_at, updated_at)}
-        end
+      [tuple] ->
+        entry = entry_from_tuple(tuple, now)
 
-      [{^key, value, expires_at}] ->
-        if expired?(expires_at, now) do
+        if is_nil(entry) or expired?(entry.expires_at, now) do
           {:error, :not_found}
         else
-          {:ok, entry(key, value, expires_at, 1, now, now)}
+          {:ok, entry}
         end
 
       _ ->
@@ -604,30 +768,47 @@ defmodule Toska.KVStore do
     end
   end
 
-  defp entry(key, value, expires_at, version, created_at, updated_at) do
+  defp entry(key, value, expires_at, version, created_at, updated_at, lease_id \\ nil) do
     %{
       key: key,
       value: value,
       expires_at: expires_at,
       version: version,
       created_at: created_at,
-      updated_at: updated_at
+      updated_at: updated_at,
+      lease_id: lease_id
     }
   end
 
-  defp next_entry(key, value, expires_at, nil, now) do
+  defp entry_from_tuple({key, value, expires_at, version, created_at, updated_at, lease_id}, _now) do
+    entry(key, value, expires_at, version, created_at, updated_at, lease_id)
+  end
+
+  defp entry_from_tuple({key, value, expires_at, version, created_at, updated_at}, _now) do
+    entry(key, value, expires_at, version, created_at, updated_at)
+  end
+
+  defp entry_from_tuple({key, value, expires_at}, now) do
     entry(key, value, expires_at, 1, now, now)
   end
 
-  defp next_entry(key, value, expires_at, current, now) do
-    entry(key, value, expires_at, current.version + 1, current.created_at, now)
+  defp entry_from_tuple(_tuple, _now), do: nil
+
+  defp next_entry(key, value, expires_at, current, now, lease_id \\ nil)
+
+  defp next_entry(key, value, expires_at, nil, now, lease_id) do
+    entry(key, value, expires_at, 1, now, now, lease_id)
+  end
+
+  defp next_entry(key, value, expires_at, current, now, lease_id) do
+    entry(key, value, expires_at, current.version + 1, current.created_at, now, lease_id)
   end
 
   defp insert_entry(entry) do
     :ets.insert(
       @table,
       {entry.key, entry.value, entry.expires_at, entry.version, entry.created_at,
-       entry.updated_at}
+       entry.updated_at, entry.lease_id}
     )
   end
 
@@ -640,6 +821,7 @@ defmodule Toska.KVStore do
       version: entry.version,
       created_at: entry.created_at,
       updated_at: entry.updated_at,
+      lease_id: entry.lease_id,
       revision: revision
     }
   end
@@ -666,6 +848,58 @@ defmodule Toska.KVStore do
   end
 
   defp normalize_ttl(_ttl_ms, _now), do: nil
+
+  defp normalize_put_options(opts) do
+    with {:ok, opts} <- normalize_options_map(opts),
+         {:ok, conditions} <- normalize_conditions(opts),
+         {:ok, lease_id} <- normalize_optional_id(condition_value(opts, :lease_id)) do
+      {:ok, %{conditions: conditions, lease_id: lease_id}}
+    else
+      {:error, :invalid_lease} -> {:error, :invalid_lease}
+      _ -> {:error, :invalid_conditions}
+    end
+  end
+
+  defp normalize_options_map(nil), do: {:ok, %{}}
+  defp normalize_options_map(opts) when is_map(opts), do: {:ok, opts}
+
+  defp normalize_options_map(opts) when is_list(opts) do
+    try do
+      {:ok, Map.new(opts)}
+    rescue
+      _ -> {:error, :invalid_options}
+    end
+  end
+
+  defp normalize_options_map(_), do: {:error, :invalid_options}
+
+  defp normalize_lease_ttl(value) when is_integer(value) and value > 0, do: {:ok, value}
+
+  defp normalize_lease_ttl(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} when int > 0 -> {:ok, int}
+      _ -> {:error, :invalid_lease}
+    end
+  end
+
+  defp normalize_lease_ttl(_), do: {:error, :invalid_lease}
+
+  defp normalize_lease_create_id(opts) do
+    with {:ok, opts} <- normalize_options_map(opts) do
+      normalize_optional_id(condition_value(opts, :id))
+    end
+  end
+
+  defp normalize_optional_id(nil), do: {:ok, nil}
+  defp normalize_optional_id(value) when is_binary(value) and value != "", do: {:ok, value}
+  defp normalize_optional_id(_), do: {:error, :invalid_lease}
+
+  defp normalize_required_id(value) when is_binary(value) and value != "", do: {:ok, value}
+  defp normalize_required_id(_), do: {:error, :invalid_lease}
+
+  defp normalize_lock_holder(nil), do: {:ok, nil}
+  defp normalize_lock_holder(value) when is_binary(value), do: {:ok, value}
+  defp normalize_lock_holder(_), do: {:error, :invalid_lock}
 
   defp normalize_conditions(nil), do: {:ok, default_conditions()}
 
@@ -933,7 +1167,8 @@ defmodule Toska.KVStore do
         version: entry.version,
         created_at: entry.created_at,
         updated_at: entry.updated_at,
-        expires_at: entry.expires_at
+        expires_at: entry.expires_at,
+        lease_id: entry.lease_id
       }
     }
   end
@@ -984,6 +1219,192 @@ defmodule Toska.KVStore do
       revision: revision,
       timestamp: now
     }
+  end
+
+  defp lease(id, ttl_ms, created_at, expires_at, updated_at) do
+    %{
+      id: id,
+      ttl_ms: ttl_ms,
+      created_at: created_at,
+      expires_at: expires_at,
+      updated_at: updated_at
+    }
+  end
+
+  defp lock(name, lease_id, holder, acquired_at, expires_at) do
+    %{
+      name: name,
+      lease_id: lease_id,
+      holder: holder,
+      acquired_at: acquired_at,
+      expires_at: expires_at
+    }
+  end
+
+  defp lease_result(lease) do
+    %{
+      id: lease.id,
+      ttl_ms: lease.ttl_ms,
+      created_at: lease.created_at,
+      updated_at: lease.updated_at,
+      expires_at: lease.expires_at
+    }
+  end
+
+  defp lock_result(lock) do
+    %{
+      name: lock.name,
+      lease_id: lock.lease_id,
+      holder: lock.holder,
+      acquired_at: lock.acquired_at,
+      expires_at: lock.expires_at
+    }
+  end
+
+  defp lease_record(op, lease) do
+    lease
+    |> lease_result()
+    |> Map.put(:op, op)
+  end
+
+  defp lock_record(op, lock) do
+    lock
+    |> lock_result()
+    |> Map.put(:op, op)
+  end
+
+  defp write_expires_at(ttl_ms, nil, _state, now), do: {:ok, normalize_ttl(ttl_ms, now)}
+
+  defp write_expires_at(_ttl_ms, lease_id, state, now) do
+    case active_lease(state.leases, lease_id, now) do
+      nil -> {:error, :lease_not_found}
+      lease -> {:ok, lease.expires_at}
+    end
+  end
+
+  defp active_lease(leases, lease_id, now) do
+    case Map.get(leases, lease_id) do
+      nil -> nil
+      lease -> if expired?(lease.expires_at, now), do: nil, else: lease
+    end
+  end
+
+  defp active_lock(state, name, now) do
+    case Map.get(state.locks, name) do
+      nil ->
+        nil
+
+      lock ->
+        case active_lease(state.leases, lock.lease_id, now) do
+          nil -> nil
+          lease -> %{lock | expires_at: lease.expires_at}
+        end
+    end
+  end
+
+  defp unique_lease_id(leases) do
+    id = "lease-" <> Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+
+    if Map.has_key?(leases, id) do
+      unique_lease_id(leases)
+    else
+      id
+    end
+  end
+
+  defp put_lease_state(state, lease) do
+    %{state | leases: Map.put(state.leases, lease.id, lease)}
+  end
+
+  defp remove_lease_state(state, lease_id) do
+    %{state | leases: Map.delete(state.leases, lease_id)}
+  end
+
+  defp put_lock_state(state, lock) do
+    %{state | locks: Map.put(state.locks, lock.name, lock)}
+  end
+
+  defp remove_lock_state(state, name) do
+    %{state | locks: Map.delete(state.locks, name)}
+  end
+
+  defp remove_locks_for_lease(state, lease_id) do
+    locks =
+      state.locks
+      |> Enum.reject(fn {_name, lock} -> lock.lease_id == lease_id end)
+      |> Map.new()
+
+    %{state | locks: locks}
+  end
+
+  defp renew_attached_locks(state, lease) do
+    locks =
+      Map.new(state.locks, fn {name, lock} ->
+        if lock.lease_id == lease.id do
+          {name, %{lock | expires_at: lease.expires_at}}
+        else
+          {name, lock}
+        end
+      end)
+
+    %{state | locks: locks}
+  end
+
+  defp renew_attached_entries(state, lease, now) do
+    lease.id
+    |> attached_entries(now)
+    |> Enum.reduce(state, fn current, state ->
+      entry = next_entry(current.key, current.value, lease.expires_at, current, now, lease.id)
+      put_entry(state, entry, now)
+    end)
+  end
+
+  defp revoke_lease(state, lease_id, now, lease_op, key_event_op) do
+    entries = attached_entries(lease_id, now)
+
+    state =
+      state
+      |> remove_lease_state(lease_id)
+      |> remove_locks_for_lease(lease_id)
+      |> append_metadata_aof(%{op: lease_op, id: lease_id})
+
+    Enum.reduce(entries, state, fn current, state ->
+      delete_entry(state, current.key, current, now, key_event_op)
+    end)
+  end
+
+  defp drop_expired_lease_id(state, nil, _now), do: state
+
+  defp drop_expired_lease_id(state, lease_id, now) do
+    case Map.get(state.leases, lease_id) do
+      nil ->
+        state
+
+      lease ->
+        if expired?(lease.expires_at, now) do
+          revoke_lease(state, lease_id, now, "lease_expire", "expire")
+        else
+          state
+        end
+    end
+  end
+
+  defp attached_entries(lease_id, now) do
+    @table
+    |> :ets.tab2list()
+    |> Enum.flat_map(fn tuple ->
+      case entry_from_tuple(tuple, now) do
+        %{lease_id: ^lease_id} = entry -> [entry]
+        _ -> []
+      end
+    end)
+  end
+
+  defp append_metadata_aof(state, record) do
+    revision = next_revision(state)
+
+    append_aof(state, Map.put(record, :revision, revision))
+    %{state | revision: revision}
   end
 
   defp publish_event(state, event) do
@@ -1053,18 +1474,25 @@ defmodule Toska.KVStore do
   end
 
   defp cleanup_expired(now, state) do
-    match_spec = [
-      {
-        {:"$1", :"$2", :"$3", :"$4", :"$5", :"$6"},
-        [{:is_integer, :"$3"}, {:"=<", :"$3", now}],
-        [{{:"$1", :"$2", :"$3", :"$4", :"$5", :"$6"}}]
-      }
-    ]
+    state =
+      state.leases
+      |> Map.values()
+      |> Enum.filter(&expired?(&1.expires_at, now))
+      |> Enum.reduce(state, fn lease, state ->
+        revoke_lease(state, lease.id, now, "lease_expire", "expire")
+      end)
 
-    :ets.select(@table, match_spec)
-    |> Enum.reduce(state, fn {key, value, expires_at, version, created_at, updated_at}, state ->
-      current = entry(key, value, expires_at, version, created_at, updated_at)
-      delete_entry(state, key, current, now, "expire")
+    @table
+    |> :ets.tab2list()
+    |> Enum.flat_map(fn tuple ->
+      case entry_from_tuple(tuple, now) do
+        nil -> []
+        entry -> [entry]
+      end
+    end)
+    |> Enum.filter(&expired?(&1.expires_at, now))
+    |> Enum.reduce(state, fn current, state ->
+      delete_entry(state, current.key, current, now, "expire")
     end)
     |> maybe_sync()
   end
@@ -1078,11 +1506,15 @@ defmodule Toska.KVStore do
           {:ok, %{"data" => data} = payload} when is_map(data) ->
             if valid_snapshot_checksum?(payload) do
               load_entries(data, now)
+              leases = load_leases(Map.get(payload, "leases"), now)
+              locks = load_locks(Map.get(payload, "locks"), leases, now)
 
               %{
                 checksum: Map.get(payload, "checksum"),
                 created_at: Map.get(payload, "created_at"),
-                store_revision: snapshot_store_revision(payload, 0)
+                store_revision: snapshot_store_revision(payload, 0),
+                leases: leases,
+                locks: locks
               }
             else
               Logger.warning("Snapshot checksum mismatch, skipping load")
@@ -1117,8 +1549,9 @@ defmodule Toska.KVStore do
             version = normalize_stored_version(Map.get(map, "version"))
             created_at = normalize_stored_timestamp(Map.get(map, "created_at"), now)
             updated_at = normalize_stored_timestamp(Map.get(map, "updated_at"), created_at)
+            lease_id = normalize_stored_id(Map.get(map, "lease_id"))
 
-            insert_entry(entry(key, value, expires_at, version, created_at, updated_at))
+            insert_entry(entry(key, value, expires_at, version, created_at, updated_at, lease_id))
           end
 
         value when is_binary(value) ->
@@ -1130,8 +1563,8 @@ defmodule Toska.KVStore do
     end)
   end
 
-  defp replay_aof(path, start_revision, history_limit) do
-    initial = %{revision: start_revision, events: []}
+  defp replay_aof(path, start_revision, history_limit, leases, locks) do
+    initial = %{revision: start_revision, events: [], leases: leases, locks: locks}
 
     case File.open(path, [:read]) do
       {:ok, io} ->
@@ -1157,18 +1590,47 @@ defmodule Toska.KVStore do
                 acc
             end
           end)
+          |> prune_loaded_state(now)
 
         File.close(io)
         result
 
       {:error, :enoent} ->
-        initial
+        prune_loaded_state(initial, now_ms())
 
       {:error, reason} ->
         Logger.warning("Failed to read AOF: #{inspect(reason)}")
-        initial
+        prune_loaded_state(initial, now_ms())
     end
   end
+
+  defp load_leases(nil, _now), do: %{}
+
+  defp load_leases(leases, now) when is_map(leases) do
+    leases
+    |> Enum.reduce(%{}, fn {_id, value}, acc ->
+      case normalize_stored_lease(value, now) do
+        nil -> acc
+        lease -> Map.put(acc, lease.id, lease)
+      end
+    end)
+  end
+
+  defp load_leases(_leases, _now), do: %{}
+
+  defp load_locks(nil, _leases, _now), do: %{}
+
+  defp load_locks(locks, leases, now) when is_map(locks) do
+    locks
+    |> Enum.reduce(%{}, fn {_name, value}, acc ->
+      case normalize_stored_lock(value, leases, now) do
+        nil -> acc
+        lock -> Map.put(acc, lock.name, lock)
+      end
+    end)
+  end
+
+  defp load_locks(_locks, _leases, _now), do: %{}
 
   # Cursor-based key collection helpers
 
@@ -1210,45 +1672,26 @@ defmodule Toska.KVStore do
   end
 
   defp collect_all_matching_keys(prefix, now) do
-    match_spec = [{{:"$1", :_, :"$2", :_, :_, :_}, [], [{{:"$1", :"$2"}}]}]
+    @table
+    |> :ets.tab2list()
+    |> Enum.reduce([], fn tuple, acc ->
+      case entry_from_tuple(tuple, now) do
+        nil ->
+          acc
 
-    case :ets.select(@table, match_spec, 1000) do
-      :"$end_of_table" ->
-        []
+        entry ->
+          cond do
+            expired?(entry.expires_at, now) ->
+              acc
 
-      {rows, continuation} ->
-        collect_all_matching_from(rows, continuation, prefix, now, [])
-    end
-  end
+            not matches_prefix?(entry.key, prefix) ->
+              acc
 
-  defp collect_all_matching_from(rows, continuation, prefix, now, acc) do
-    acc =
-      Enum.reduce(rows, acc, fn {key, expires_at}, acc ->
-        cond do
-          expired?(expires_at, now) ->
-            acc
-
-          not matches_prefix?(key, prefix) ->
-            acc
-
-          true ->
-            [key | acc]
-        end
-      end)
-
-    case continuation do
-      :"$end_of_table" ->
-        acc
-
-      _ ->
-        case :ets.select(continuation) do
-          :"$end_of_table" ->
-            acc
-
-          {next_rows, next_continuation} ->
-            collect_all_matching_from(next_rows, next_continuation, prefix, now, acc)
-        end
-    end
+            true ->
+              [entry.key | acc]
+          end
+      end
+    end)
   end
 
   defp matches_prefix?(_key, ""), do: true
@@ -1271,17 +1714,24 @@ defmodule Toska.KVStore do
 
     data =
       :ets.tab2list(@table)
-      |> Enum.reduce(%{}, fn {key, value, expires_at, version, created_at, updated_at}, acc ->
-        if expired?(expires_at, now) do
-          acc
-        else
-          Map.put(acc, key, %{
-            "value" => value,
-            "expires_at" => expires_at,
-            "version" => version,
-            "created_at" => created_at,
-            "updated_at" => updated_at
-          })
+      |> Enum.reduce(%{}, fn tuple, acc ->
+        case entry_from_tuple(tuple, now) do
+          nil ->
+            acc
+
+          entry ->
+            if expired?(entry.expires_at, now) do
+              acc
+            else
+              Map.put(acc, entry.key, %{
+                "value" => entry.value,
+                "expires_at" => entry.expires_at,
+                "version" => entry.version,
+                "created_at" => entry.created_at,
+                "updated_at" => entry.updated_at,
+                "lease_id" => entry.lease_id
+              })
+            end
         end
       end)
 
@@ -1292,7 +1742,9 @@ defmodule Toska.KVStore do
       "created_at" => now,
       "store_revision" => state.revision,
       "checksum" => checksum,
-      "data" => data
+      "data" => data,
+      "leases" => snapshot_leases(state.leases, now),
+      "locks" => snapshot_locks(state.locks, state.leases, now)
     }
 
     tmp_path = state.snapshot_path <> ".tmp"
@@ -1487,6 +1939,140 @@ defmodule Toska.KVStore do
   defp normalize_stored_timestamp(value, _default) when is_integer(value) and value > 0, do: value
   defp normalize_stored_timestamp(_value, default), do: default
 
+  defp normalize_stored_id(value) when is_binary(value) and value != "", do: value
+  defp normalize_stored_id(_), do: nil
+
+  defp normalize_stored_holder(nil), do: nil
+  defp normalize_stored_holder(value) when is_binary(value), do: value
+  defp normalize_stored_holder(_), do: nil
+
+  defp normalize_stored_positive_int(value) when is_integer(value) and value > 0, do: value
+
+  defp normalize_stored_positive_int(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} when int > 0 -> int
+      _ -> nil
+    end
+  end
+
+  defp normalize_stored_positive_int(_), do: nil
+
+  defp normalize_stored_lease(value, now) when is_map(value) do
+    id = normalize_stored_id(condition_value(value, :id))
+    ttl_ms = normalize_stored_positive_int(condition_value(value, :ttl_ms))
+    created_at = normalize_stored_timestamp(condition_value(value, :created_at), now)
+    expires_at = normalize_stored_timestamp(condition_value(value, :expires_at), nil)
+    updated_at = normalize_stored_timestamp(condition_value(value, :updated_at), created_at)
+
+    cond do
+      is_nil(id) or is_nil(ttl_ms) or is_nil(expires_at) ->
+        nil
+
+      expired?(expires_at, now) ->
+        nil
+
+      true ->
+        lease(id, ttl_ms, created_at, expires_at, updated_at)
+    end
+  end
+
+  defp normalize_stored_lease(_value, _now), do: nil
+
+  defp normalize_stored_lock(value, leases, now) when is_map(value) do
+    name = normalize_stored_id(condition_value(value, :name))
+    lease_id = normalize_stored_id(condition_value(value, :lease_id))
+    holder = normalize_stored_holder(condition_value(value, :holder))
+    acquired_at = normalize_stored_timestamp(condition_value(value, :acquired_at), now)
+
+    with name when is_binary(name) <- name,
+         lease_id when is_binary(lease_id) <- lease_id,
+         lease when not is_nil(lease) <- active_lease(leases, lease_id, now) do
+      lock(name, lease_id, holder, acquired_at, lease.expires_at)
+    else
+      _ -> nil
+    end
+  end
+
+  defp normalize_stored_lock(_value, _leases, _now), do: nil
+
+  defp snapshot_leases(leases, now) do
+    leases
+    |> Map.values()
+    |> Enum.reject(&expired?(&1.expires_at, now))
+    |> Map.new(fn lease ->
+      {lease.id,
+       %{
+         "id" => lease.id,
+         "ttl_ms" => lease.ttl_ms,
+         "created_at" => lease.created_at,
+         "updated_at" => lease.updated_at,
+         "expires_at" => lease.expires_at
+       }}
+    end)
+  end
+
+  defp snapshot_locks(locks, leases, now) do
+    locks
+    |> Enum.reduce(%{}, fn {name, lock}, acc ->
+      case active_lease(leases, lock.lease_id, now) do
+        nil ->
+          acc
+
+        lease ->
+          Map.put(acc, name, %{
+            "name" => name,
+            "lease_id" => lock.lease_id,
+            "holder" => lock.holder,
+            "acquired_at" => lock.acquired_at,
+            "expires_at" => lease.expires_at
+          })
+      end
+    end)
+  end
+
+  defp active_lease_count(leases) do
+    now = now_ms()
+
+    Enum.count(leases, fn {_id, lease} ->
+      not expired?(lease.expires_at, now)
+    end)
+  end
+
+  defp active_lock_count(locks, leases) do
+    now = now_ms()
+
+    Enum.count(locks, fn {_name, lock} ->
+      not is_nil(active_lease(leases, lock.lease_id, now))
+    end)
+  end
+
+  defp prune_loaded_state(state, now) do
+    leases =
+      state.leases
+      |> Enum.reject(fn {_id, lease} -> expired?(lease.expires_at, now) end)
+      |> Map.new()
+
+    locks =
+      state.locks
+      |> Enum.reject(fn {_name, lock} -> is_nil(active_lease(leases, lock.lease_id, now)) end)
+      |> Map.new()
+
+    :ets.tab2list(@table)
+    |> Enum.each(fn tuple ->
+      case entry_from_tuple(tuple, now) do
+        %{lease_id: lease_id, key: key} when not is_nil(lease_id) ->
+          if is_nil(active_lease(leases, lease_id, now)) do
+            :ets.delete(@table, key)
+          end
+
+        _ ->
+          :ok
+      end
+    end)
+
+    %{state | leases: leases, locks: locks}
+  end
+
   defp snapshot_store_revision(payload, default) do
     normalize_store_revision(Map.get(payload, "store_revision"), default)
   end
@@ -1507,6 +2093,7 @@ defmodule Toska.KVStore do
     record = Map.put(record, "revision", revision)
 
     apply_aof_record(record, now)
+    acc = apply_state_record(acc, record, now)
 
     events =
       case event_from_aof_record(record, now) do
@@ -1514,7 +2101,7 @@ defmodule Toska.KVStore do
         event -> store_watch_event(acc.events, event, history_limit)
       end
 
-    %{revision: max(acc.revision, revision), events: events}
+    %{acc | revision: max(acc.revision, revision), events: events}
   end
 
   defp apply_replicated_record(record, state, now) do
@@ -1524,7 +2111,10 @@ defmodule Toska.KVStore do
     apply_aof_record(record, now)
     append_aof(state, record)
 
-    state = %{state | revision: max(state.revision, revision)}
+    state =
+      state
+      |> apply_state_record(record, now)
+      |> Map.put(:revision, max(state.revision, revision))
 
     case event_from_aof_record(record, now) do
       nil -> state
@@ -1536,6 +2126,53 @@ defmodule Toska.KVStore do
     record
     |> Map.get("revision", Map.get(record, :revision))
     |> normalize_store_revision(default)
+  end
+
+  defp apply_state_record(state, record, now) do
+    case condition_value(record, :op) do
+      "lease_create" ->
+        case normalize_stored_lease(record, now) do
+          nil -> state
+          lease -> put_lease_state(state, lease)
+        end
+
+      "lease_keepalive" ->
+        case normalize_stored_lease(record, now) do
+          nil ->
+            state
+
+          lease ->
+            state
+            |> put_lease_state(lease)
+            |> renew_attached_locks(lease)
+        end
+
+      op when op in ["lease_delete", "lease_expire"] ->
+        case normalize_stored_id(condition_value(record, :id)) do
+          nil ->
+            state
+
+          lease_id ->
+            state
+            |> remove_lease_state(lease_id)
+            |> remove_locks_for_lease(lease_id)
+        end
+
+      "lock_acquire" ->
+        case normalize_stored_lock(record, state.leases, now) do
+          nil -> state
+          lock -> put_lock_state(state, lock)
+        end
+
+      "lock_release" ->
+        case normalize_stored_id(condition_value(record, :name)) do
+          nil -> state
+          name -> remove_lock_state(state, name)
+        end
+
+      _ ->
+        state
+    end
   end
 
   defp apply_aof_record(%{"op" => "set", "key" => key, "value" => value} = record, now) do
@@ -1550,7 +2187,8 @@ defmodule Toska.KVStore do
             expires_at,
             normalize_stored_version(Map.get(record, "version")),
             normalize_stored_timestamp(Map.get(record, "created_at"), now),
-            normalize_stored_timestamp(Map.get(record, "updated_at"), now)
+            normalize_stored_timestamp(Map.get(record, "updated_at"), now),
+            normalize_stored_id(Map.get(record, "lease_id"))
           )
         else
           next_entry(key, value, expires_at, current_entry(key, now), now)
@@ -1585,7 +2223,8 @@ defmodule Toska.KVStore do
           expires_at,
           normalize_stored_version(Map.get(record, "version")),
           normalize_stored_timestamp(Map.get(record, "created_at"), now),
-          normalize_stored_timestamp(Map.get(record, "updated_at"), now)
+          normalize_stored_timestamp(Map.get(record, "updated_at"), now),
+          normalize_stored_id(Map.get(record, "lease_id"))
         )
 
       put_event(entry, revision, now)

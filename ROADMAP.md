@@ -84,6 +84,16 @@ This is one of the most important differentiators for ToskaStore's HTTP-native p
 
 ### 4. Leases and Locks
 
+Status: Complete.
+
+Implementation checkpoints:
+
+- [x] Add persisted lease lifecycle operations.
+- [x] Attach keys to leases through `lease_id`.
+- [x] Add lease-backed lock acquire/release operations.
+- [x] Expose leases and locks over HTTP.
+- [x] Add regression tests and API documentation.
+
 Build coordination primitives on top of revisions and TTLs:
 
 - `POST /leases`
@@ -177,6 +187,6 @@ For larger-than-memory datasets, evaluate an LSM-style or embedded durable backe
 
 ## Recommended Next PR
 
-Implement leases and locks.
+Implement the scalable prefix range API.
 
-Per-key revisions, conditional writes, atomic transactions, and the watch stream are now in place, so the next highest-leverage step is lightweight coordination primitives built on TTLs and revisions.
+Leases and locks now give ToskaStore a lightweight coordination story. The next highest-leverage step is making prefix/range reads scale beyond collecting and sorting all matching keys in memory.
