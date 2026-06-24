@@ -63,7 +63,10 @@ defmodule Toska.RouterKVTest do
       |> Toska.Router.call(@opts)
 
     assert get_conn.status == 200
-    assert Jason.decode!(get_conn.resp_body)["value"] == "1"
+    get_body = Jason.decode!(get_conn.resp_body)
+    assert get_body["value"] == "1"
+    assert get_body["metadata"]["version"] == 1
+    assert get_resp_header(get_conn, "etag") == ["\"1\""]
 
     delete_conn =
       conn("DELETE", "/kv/alpha")
@@ -76,6 +79,118 @@ defmodule Toska.RouterKVTest do
       |> Toska.Router.call(@opts)
 
     assert missing_conn.status == 404
+  end
+
+  test "PUT and DELETE support conditional writes with metadata and etags" do
+    create_conn =
+      conn("PUT", "/kv/cas", Jason.encode!(%{value: "1", if_absent: true}))
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert create_conn.status == 200
+    create_body = Jason.decode!(create_conn.resp_body)
+    assert create_body["metadata"]["version"] == 1
+    assert get_resp_header(create_conn, "etag") == ["\"1\""]
+
+    duplicate_conn =
+      conn("PUT", "/kv/cas", Jason.encode!(%{value: "again", if_absent: true}))
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert duplicate_conn.status == 412
+
+    update_conn =
+      conn("PUT", "/kv/cas", Jason.encode!(%{value: "2"}))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("if-match", "\"1\"")
+      |> Toska.Router.call(@opts)
+
+    assert update_conn.status == 200
+    update_body = Jason.decode!(update_conn.resp_body)
+    assert update_body["value"] == "2"
+    assert update_body["metadata"]["version"] == 2
+    assert get_resp_header(update_conn, "etag") == ["\"2\""]
+
+    stale_delete_conn =
+      conn("DELETE", "/kv/cas?if_version=1")
+      |> Toska.Router.call(@opts)
+
+    assert stale_delete_conn.status == 412
+
+    delete_conn =
+      conn("DELETE", "/kv/cas")
+      |> put_req_header("if-match", "\"2\"")
+      |> Toska.Router.call(@opts)
+
+    assert delete_conn.status == 200
+  end
+
+  test "PUT rejects malformed conditional write fields" do
+    conn =
+      conn("PUT", "/kv/bad-condition", Jason.encode!(%{value: "1", if_version: "nope"}))
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert conn.status == 400
+    assert Jason.decode!(conn.resp_body)["error"] == "Invalid conditions"
+  end
+
+  test "txn applies success branch when compares pass" do
+    :ok = Toska.KVStore.put("txn-http:guard", "old")
+
+    body =
+      Jason.encode!(%{
+        compare: [%{key: "txn-http:guard", version: 1}],
+        success: [
+          %{op: "put", key: "txn-http:guard", value: "new"},
+          %{op: "get", key: "txn-http:guard"}
+        ],
+        failure: [%{op: "put", key: "txn-http:fallback", value: "no"}]
+      })
+
+    conn =
+      conn("POST", "/kv/txn", body)
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert conn.status == 200
+    response = Jason.decode!(conn.resp_body)
+    assert response["succeeded"] == true
+    assert Enum.map(response["responses"], & &1["op"]) == ["put", "get"]
+    assert get_in(response, ["responses", Access.at(0), "metadata", "version"]) == 2
+    assert {:ok, "new"} = Toska.KVStore.get("txn-http:guard")
+    assert {:error, :not_found} = Toska.KVStore.get("txn-http:fallback")
+  end
+
+  test "txn applies failure branch when compares fail" do
+    body =
+      Jason.encode!(%{
+        compare: [%{key: "txn-http:missing", exists: true}],
+        success: [%{op: "put", key: "txn-http:success", value: "yes"}],
+        failure: [%{op: "put", key: "txn-http:fallback", value: "used"}]
+      })
+
+    conn =
+      conn("POST", "/kv/txn", body)
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert conn.status == 200
+    response = Jason.decode!(conn.resp_body)
+    assert response["succeeded"] == false
+    assert Enum.map(response["responses"], & &1["op"]) == ["put"]
+    assert {:ok, "used"} = Toska.KVStore.get("txn-http:fallback")
+    assert {:error, :not_found} = Toska.KVStore.get("txn-http:success")
+  end
+
+  test "txn rejects invalid payloads" do
+    conn =
+      conn("POST", "/kv/txn", Jason.encode!(%{compare: [%{key: "bad"}]}))
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert conn.status == 400
+    assert Jason.decode!(conn.resp_body)["error"] == "Invalid transaction"
   end
 
   test "root endpoint returns html" do
@@ -398,6 +513,17 @@ defmodule Toska.RouterKVTest do
       |> Toska.Router.call(@opts)
 
     assert write_conn.status == 403
+
+    txn_conn =
+      conn(
+        "POST",
+        "/kv/txn",
+        Jason.encode!(%{success: [%{op: "put", key: "readonly", value: "x"}]})
+      )
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert txn_conn.status == 403
 
     read_conn =
       conn("GET", "/kv/readonly")

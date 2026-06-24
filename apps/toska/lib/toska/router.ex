@@ -356,13 +356,41 @@ defmodule Toska.Router do
     end
   end
 
-  # GET /kv/:key - fetch value
-  get "/kv/:key" do
-    case Toska.KVStore.get(key) do
-      {:ok, value} ->
+  # POST /kv/txn - compare-and-apply transaction
+  post "/kv/txn" do
+    compare = conn.body_params["compare"] || []
+    success = conn.body_params["success"] || []
+    failure = conn.body_params["failure"] || []
+
+    case Toska.KVStore.txn(compare, success, failure) do
+      {:ok, result} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(200, Jason.encode!(%{key: key, value: value}))
+        |> send_resp(200, Jason.encode!(result))
+
+      {:error, :invalid_transaction} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(400, Jason.encode!(%{error: "Invalid transaction"}))
+
+      {:error, reason} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)})
+        )
+    end
+  end
+
+  # GET /kv/:key - fetch value
+  get "/kv/:key" do
+    case Toska.KVStore.get_entry(key) do
+      {:ok, entry} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> put_entry_etag(entry)
+        |> send_resp(200, Jason.encode!(entry_response(entry)))
 
       {:error, :not_found} ->
         conn
@@ -383,6 +411,7 @@ defmodule Toska.Router do
   put "/kv/:key" do
     value = conn.body_params["value"]
     ttl_ms = conn.body_params["ttl_ms"]
+    conditions = write_conditions(conn)
 
     cond do
       not is_binary(value) ->
@@ -391,11 +420,30 @@ defmodule Toska.Router do
         |> send_resp(400, Jason.encode!(%{error: "Value must be a string"}))
 
       true ->
-        case Toska.KVStore.put(key, value, ttl_ms) do
+        case Toska.KVStore.put(key, value, ttl_ms, conditions) do
           :ok ->
+            case Toska.KVStore.get_entry(key) do
+              {:ok, entry} ->
+                conn
+                |> put_resp_content_type("application/json")
+                |> put_entry_etag(entry)
+                |> send_resp(200, Jason.encode!(Map.put(entry_response(entry), :ok, true)))
+
+              {:error, :not_found} ->
+                conn
+                |> put_resp_content_type("application/json")
+                |> send_resp(200, Jason.encode!(%{ok: true, key: key}))
+            end
+
+          {:error, :condition_failed} ->
             conn
             |> put_resp_content_type("application/json")
-            |> send_resp(200, Jason.encode!(%{ok: true, key: key}))
+            |> send_resp(412, Jason.encode!(%{error: "Condition failed", key: key}))
+
+          {:error, :invalid_conditions} ->
+            conn
+            |> put_resp_content_type("application/json")
+            |> send_resp(400, Jason.encode!(%{error: "Invalid conditions"}))
 
           {:error, reason} ->
             conn
@@ -410,11 +458,21 @@ defmodule Toska.Router do
 
   # DELETE /kv/:key - remove value
   delete "/kv/:key" do
-    case Toska.KVStore.delete(key) do
+    case Toska.KVStore.delete(key, write_conditions(conn)) do
       :ok ->
         conn
         |> put_resp_content_type("application/json")
         |> send_resp(200, Jason.encode!(%{ok: true, key: key}))
+
+      {:error, :condition_failed} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(412, Jason.encode!(%{error: "Condition failed", key: key}))
+
+      {:error, :invalid_conditions} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(400, Jason.encode!(%{error: "Invalid conditions"}))
 
       {:error, reason} ->
         conn
@@ -621,7 +679,8 @@ defmodule Toska.Router do
     method = conn.method
     path = conn.request_path
 
-    method in ["PUT", "DELETE"] and String.starts_with?(path, "/kv/")
+    (method in ["PUT", "DELETE"] and String.starts_with?(path, "/kv/")) or
+      (method == "POST" and path == "/kv/txn")
   end
 
   defp follower_mode? do
@@ -646,6 +705,78 @@ defmodule Toska.Router do
 
   defp rate_limit_config do
     ConfigManager.cached_rate_limit()
+  end
+
+  defp entry_response(entry) do
+    %{
+      key: entry.key,
+      value: entry.value,
+      metadata: entry_metadata(entry)
+    }
+  end
+
+  defp entry_metadata(entry) do
+    %{
+      version: entry.version,
+      created_at: entry.created_at,
+      updated_at: entry.updated_at,
+      expires_at: entry.expires_at
+    }
+  end
+
+  defp put_entry_etag(conn, entry) do
+    put_resp_header(conn, "etag", etag(entry.version))
+  end
+
+  defp etag(version), do: ~s("#{version}")
+
+  defp write_conditions(conn) do
+    %{
+      if_version:
+        first_present([
+          conn.body_params["if_version"],
+          conn.params["if_version"],
+          if_match_version(conn)
+        ]),
+      if_absent:
+        first_present([
+          conn.body_params["if_absent"],
+          conn.params["if_absent"],
+          if_none_match_absent(conn)
+        ]),
+      if_present:
+        first_present([
+          conn.body_params["if_present"],
+          conn.params["if_present"]
+        ])
+    }
+  end
+
+  defp first_present(values) do
+    Enum.find(values, &(not is_nil(&1)))
+  end
+
+  defp if_match_version(conn) do
+    conn
+    |> get_req_header("if-match")
+    |> List.first()
+    |> parse_etag_version()
+  end
+
+  defp if_none_match_absent(conn) do
+    case get_req_header(conn, "if-none-match") |> List.first() do
+      "*" -> true
+      _ -> nil
+    end
+  end
+
+  defp parse_etag_version(nil), do: nil
+
+  defp parse_etag_version(value) do
+    value
+    |> String.trim()
+    |> String.trim_leading("W/")
+    |> String.trim("\"")
   end
 
   defp parse_key_list_limit(nil), do: {:ok, 100}

@@ -30,6 +30,100 @@ defmodule Toska.KVStoreTest do
     assert {:ok, "1"} = Toska.KVStore.get("alpha")
   end
 
+  test "get_entry returns metadata and increments versions on update" do
+    assert :ok = Toska.KVStore.put("meta", "1")
+    assert {:ok, first} = Toska.KVStore.get_entry("meta")
+    assert first.value == "1"
+    assert first.version == 1
+    assert is_integer(first.created_at)
+    assert is_integer(first.updated_at)
+    assert is_nil(first.expires_at)
+
+    :timer.sleep(2)
+    assert :ok = Toska.KVStore.put("meta", "2")
+    assert {:ok, second} = Toska.KVStore.get_entry("meta")
+    assert second.value == "2"
+    assert second.version == 2
+    assert second.created_at == first.created_at
+    assert second.updated_at >= first.updated_at
+  end
+
+  test "conditional puts enforce absent present and version checks" do
+    assert :ok = Toska.KVStore.put("nil-conditions", "1", nil, nil)
+    assert :ok = Toska.KVStore.put("cas", "1", nil, if_absent: true)
+    assert {:error, :condition_failed} = Toska.KVStore.put("cas", "again", nil, if_absent: true)
+
+    assert {:error, :condition_failed} = Toska.KVStore.put("missing", "1", nil, if_present: true)
+
+    assert :ok = Toska.KVStore.put("cas", "2", nil, if_version: 1)
+    assert {:ok, entry} = Toska.KVStore.get_entry("cas")
+    assert entry.value == "2"
+    assert entry.version == 2
+
+    assert {:error, :condition_failed} = Toska.KVStore.put("cas", "stale", nil, if_version: 1)
+    assert {:error, :invalid_conditions} = Toska.KVStore.put("cas", "bad", nil, ["bad"])
+
+    assert {:error, :invalid_conditions} =
+             Toska.KVStore.put("cas", "bad", nil, if_absent: true, if_present: true)
+  end
+
+  test "conditional deletes enforce version checks" do
+    assert :ok = Toska.KVStore.put("delete-cas", "1")
+    assert {:error, :condition_failed} = Toska.KVStore.delete("delete-cas", if_version: 2)
+    assert {:ok, "1"} = Toska.KVStore.get("delete-cas")
+
+    assert :ok = Toska.KVStore.delete("delete-cas", if_version: 1)
+    assert {:error, :not_found} = Toska.KVStore.get("delete-cas")
+  end
+
+  test "txn applies success operations when compares pass" do
+    assert :ok = Toska.KVStore.put("txn:item", "old")
+
+    assert {:ok, result} =
+             Toska.KVStore.txn(
+               [%{key: "txn:item", version: 1}],
+               [
+                 %{op: "put", key: "txn:item", value: "new"},
+                 %{op: "put", key: "txn:created", value: "yes"},
+                 %{op: "get", key: "txn:item"}
+               ],
+               [%{op: "put", key: "txn:failed", value: "no"}]
+             )
+
+    assert result.succeeded == true
+    assert Enum.map(result.responses, & &1.op) == ["put", "put", "get"]
+    assert {:ok, item} = Toska.KVStore.get_entry("txn:item")
+    assert item.value == "new"
+    assert item.version == 2
+    assert {:ok, "yes"} = Toska.KVStore.get("txn:created")
+    assert {:error, :not_found} = Toska.KVStore.get("txn:failed")
+  end
+
+  test "txn applies failure operations when compares fail" do
+    assert :ok = Toska.KVStore.put("txn:guard", "actual")
+
+    assert {:ok, result} =
+             Toska.KVStore.txn(
+               [%{key: "txn:guard", exists: true, value: "expected"}],
+               [%{op: "put", key: "txn:success", value: "yes"}],
+               [
+                 %{op: "put", key: "txn:fallback", value: "used"},
+                 %{op: "delete", key: "txn:success"}
+               ]
+             )
+
+    assert result.succeeded == false
+    assert Enum.map(result.responses, & &1.op) == ["put", "delete"]
+    assert {:ok, "used"} = Toska.KVStore.get("txn:fallback")
+    assert {:error, :not_found} = Toska.KVStore.get("txn:success")
+  end
+
+  test "txn validates compare and operation payloads" do
+    assert {:error, :invalid_transaction} = Toska.KVStore.txn([%{key: "bad"}], [], [])
+    assert {:error, :invalid_transaction} = Toska.KVStore.txn([], [%{op: "put"}], [])
+    assert {:error, :invalid_transaction} = Toska.KVStore.txn("bad", [], [])
+  end
+
   test "ttl expires keys" do
     assert :ok = Toska.KVStore.put("temp", "value", 10)
     :timer.sleep(20)
@@ -38,9 +132,12 @@ defmodule Toska.KVStoreTest do
 
   test "aof replay restores values on restart" do
     assert :ok = Toska.KVStore.put("persist", "yes")
+    assert :ok = Toska.KVStore.put("persist", "yes2")
     stop_store()
     start_store()
-    assert {:ok, "yes"} = Toska.KVStore.get("persist")
+    assert {:ok, entry} = Toska.KVStore.get_entry("persist")
+    assert entry.value == "yes2"
+    assert entry.version == 2
   end
 
   test "invalid snapshot checksum skips load" do
@@ -86,6 +183,29 @@ defmodule Toska.KVStoreTest do
 
     assert :ok = Toska.KVStore.apply_replication([record])
     assert {:ok, "ok"} = Toska.KVStore.get("rep")
+    assert {:ok, entry} = Toska.KVStore.get_entry("rep")
+    assert entry.version == 1
+  end
+
+  test "apply_replication preserves metadata when present" do
+    record = %{
+      "v" => 1,
+      "op" => "set",
+      "key" => "rep-meta",
+      "value" => "ok",
+      "version" => 7,
+      "created_at" => 100,
+      "updated_at" => 200
+    }
+
+    record = Map.put(record, "checksum", checksum(record))
+
+    assert :ok = Toska.KVStore.apply_replication([record])
+    assert {:ok, entry} = Toska.KVStore.get_entry("rep-meta")
+    assert entry.value == "ok"
+    assert entry.version == 7
+    assert entry.created_at == 100
+    assert entry.updated_at == 200
   end
 
   test "apply_replication persists checksums without breaking replay" do
