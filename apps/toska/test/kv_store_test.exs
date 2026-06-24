@@ -124,6 +124,64 @@ defmodule Toska.KVStoreTest do
     assert {:error, :invalid_transaction} = Toska.KVStore.txn("bad", [], [])
   end
 
+  test "watch replays matching events after a revision" do
+    assert :ok = Toska.KVStore.put("watch:a", "1")
+    assert :ok = Toska.KVStore.put("other:a", "skip")
+    assert :ok = Toska.KVStore.put("watch:b", "2")
+
+    assert {:ok, watch} = Toska.KVStore.watch("watch:", 0)
+
+    assert watch.current_revision == 3
+    assert Enum.map(watch.events, & &1.op) == ["put", "put"]
+    assert Enum.map(watch.events, & &1.key) == ["watch:a", "watch:b"]
+    assert Enum.map(watch.events, & &1.revision) == [1, 3]
+    assert :ok = Toska.KVStore.unwatch(watch.ref)
+  end
+
+  test "watch subscribers receive live put delete and expire events" do
+    assert {:ok, watch} = Toska.KVStore.watch("live:", nil)
+
+    assert :ok = Toska.KVStore.put("live:key", "1")
+    assert_receive {Toska.KVStore, :watch_event, ref, put_event}, 100
+    assert ref == watch.ref
+    assert put_event.op == "put"
+    assert put_event.key == "live:key"
+    assert put_event.value == "1"
+    assert put_event.revision == 1
+
+    assert :ok = Toska.KVStore.delete("live:key")
+    assert_receive {Toska.KVStore, :watch_event, ^ref, delete_event}, 100
+    assert delete_event.op == "delete"
+    assert delete_event.key == "live:key"
+    assert delete_event.revision == 2
+
+    assert :ok = Toska.KVStore.put("live:ttl", "gone", 5)
+    assert_receive {Toska.KVStore, :watch_event, ^ref, ttl_put_event}, 100
+    assert ttl_put_event.op == "put"
+    :timer.sleep(20)
+    assert {:error, :not_found} = Toska.KVStore.get("live:ttl")
+    :timer.sleep(1100)
+    assert_receive {Toska.KVStore, :watch_event, ^ref, expire_event}, 1500
+    assert expire_event.op == "expire"
+    assert expire_event.key == "live:ttl"
+
+    assert :ok = Toska.KVStore.unwatch(ref)
+  end
+
+  test "watch history is rebuilt from AOF on restart" do
+    assert :ok = Toska.KVStore.put("replay:a", "1")
+    assert :ok = Toska.KVStore.delete("replay:a")
+
+    stop_store()
+    start_store()
+
+    assert {:ok, watch} = Toska.KVStore.watch("replay:", 0)
+    assert Enum.map(watch.events, & &1.op) == ["put", "delete"]
+    assert Enum.map(watch.events, & &1.revision) == [1, 2]
+    assert watch.current_revision == 2
+    assert :ok = Toska.KVStore.unwatch(watch.ref)
+  end
+
   test "ttl expires keys" do
     assert :ok = Toska.KVStore.put("temp", "value", 10)
     :timer.sleep(20)

@@ -194,6 +194,7 @@ When the server is running, the HTTP API provides a simple JSON key/value store:
 - `DELETE /kv/:key` - Remove a key
 - `POST /kv/mget` - Fetch multiple keys (`{"keys": ["a", "b"]}`)
 - `POST /kv/txn` - Atomically compare keys and apply a success or failure operation list
+- `GET /kv/watch?prefix=&since_revision=0` - Server-Sent Events change feed
 - `GET /stats` - Store metrics and persistence info
 - `GET /replication/info` - Snapshot + AOF metadata for followers
 - `GET /replication/snapshot` - JSON snapshot file
@@ -271,6 +272,31 @@ Response:
 ```
 
 Compares support `version`, `exists`, and `value`. Operations support `put`, `delete`, and `get`. Invalid transaction payloads return `400`.
+
+### Watch Change Feed
+
+`GET /kv/watch` streams key changes as Server-Sent Events. Events include a monotonic store `revision`, the operation, key, timestamp, and entry metadata when available.
+
+```bash
+curl -N "http://localhost:4000/kv/watch?prefix=todo:&since_revision=0"
+```
+
+Example event:
+
+```text
+id: 42
+event: put
+data: {"op":"put","key":"todo:1","value":"ship","revision":42,"timestamp":1782269820000,"metadata":{"version":3,"created_at":1782269800000,"updated_at":1782269820000,"expires_at":null}}
+```
+
+Query parameters:
+
+- `prefix` filters events to matching keys.
+- `since_revision` replays retained events after the supplied store revision. Omit it to start from the current live stream.
+- `once=true` returns only replayed events and closes the stream.
+- `timeout_ms=1000` closes an idle live stream after the timeout, mainly for bounded clients and tests.
+
+The stream emits `put`, `delete`, and `expire` events. Replay is available from the current AOF/revision window and in-memory watch history; requests older than retained history return `409`.
 
 ### Key Listing
 
@@ -363,6 +389,7 @@ Set `TOSKA_CONFIG_DIR` to override the configuration directory used for `toska_c
 - **ttl_check_interval_ms** - TTL cleanup interval (default: 1000)
 - **compaction_interval_ms** - AOF compaction interval (default: 300000)
 - **compaction_aof_bytes** - AOF size threshold for compaction (default: 10485760)
+- **watch_history_limit** - Maximum in-memory watch events retained for replay (default: 10000)
 - **replica_url** - Leader URL for follower replication (default: empty)
 - **replica_poll_interval_ms** - Follower poll interval (default: 1000)
 - **replica_http_timeout_ms** - Follower HTTP timeout (default: 5000)

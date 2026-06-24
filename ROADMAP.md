@@ -63,6 +63,16 @@ The current GenServer serialization model makes this practical without server-si
 
 ### 3. Watch / Change Feed
 
+Status: Complete.
+
+Implementation checkpoints:
+
+- [x] Add monotonic store revisions to write records.
+- [x] Keep replayable watch history from the current AOF/revision window.
+- [x] Publish live `put`, `delete`, and `expire` events from the KV GenServer.
+- [x] Expose `GET /kv/watch` as a Server-Sent Events stream.
+- [x] Add regression tests and API documentation.
+
 Add an HTTP-native change stream:
 
 - `GET /kv/watch?prefix=...&since_revision=...`
@@ -167,6 +177,6 @@ For larger-than-memory datasets, evaluate an LSM-style or embedded durable backe
 
 ## Recommended Next PR
 
-Implement the watch / change feed.
+Implement leases and locks.
 
-Per-key revisions, conditional writes, and atomic transactions are now in place, so the next highest-leverage step is an HTTP-native stream for key changes.
+Per-key revisions, conditional writes, atomic transactions, and the watch stream are now in place, so the next highest-leverage step is lightweight coordination primitives built on TTLs and revisions.

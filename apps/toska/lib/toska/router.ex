@@ -90,6 +90,7 @@ defmodule Toska.Router do
         <li><a href="/stats">/stats</a> - KV store stats</li>
         <li>/kv/&lt;key&gt; - GET/PUT/DELETE key/value</li>
         <li>/kv/mget - POST body {"keys": ["a", "b"]}</li>
+        <li>/kv/watch?prefix=&amp;since_revision=0 - Server-Sent Events key change feed</li>
         <li><a href="/replication/info">/replication/info</a> - Replication metadata</li>
         <li><a href="/replication/status">/replication/status</a> - Follower status</li>
         <li><a href="/replication/snapshot">/replication/snapshot</a> - Snapshot file</li>
@@ -356,6 +357,42 @@ defmodule Toska.Router do
     end
   end
 
+  # GET /kv/watch?prefix=...&since_revision=... - SSE change feed
+  get "/kv/watch" do
+    prefix = conn.params["prefix"] || ""
+
+    with {:ok, since_revision} <- parse_watch_revision(conn.params["since_revision"]),
+         {:ok, once?} <- parse_bool_param(conn.params["once"], false),
+         {:ok, timeout_ms} <- parse_watch_timeout(conn.params["timeout_ms"]),
+         {:ok, watch} <- Toska.KVStore.watch(prefix, since_revision) do
+      conn
+      |> put_resp_content_type("text/event-stream")
+      |> put_resp_header("cache-control", "no-cache")
+      |> put_resp_header("x-accel-buffering", "no")
+      |> put_resp_header("x-toska-revision", Integer.to_string(watch.current_revision))
+      |> send_chunked(200)
+      |> stream_watch(watch, once?, timeout_ms)
+    else
+      {:error, :invalid_watch} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(400, Jason.encode!(%{error: "Invalid watch parameters"}))
+
+      {:error, :history_unavailable} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(409, Jason.encode!(%{error: "Watch history unavailable"}))
+
+      {:error, reason} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)})
+        )
+    end
+  end
+
   # POST /kv/txn - compare-and-apply transaction
   post "/kv/txn" do
     compare = conn.body_params["compare"] || []
@@ -578,6 +615,121 @@ defmodule Toska.Router do
   end
 
   defp parse_max_bytes(_), do: 1024 * 1024
+
+  defp parse_watch_revision(nil), do: {:ok, nil}
+  defp parse_watch_revision(value) when is_integer(value) and value >= 0, do: {:ok, value}
+
+  defp parse_watch_revision(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} when int >= 0 -> {:ok, int}
+      _ -> {:error, :invalid_watch}
+    end
+  end
+
+  defp parse_watch_revision(_value), do: {:error, :invalid_watch}
+
+  defp parse_bool_param(nil, default), do: {:ok, default}
+
+  defp parse_bool_param(value, _default) when is_binary(value) do
+    case String.downcase(value) do
+      "true" -> {:ok, true}
+      "1" -> {:ok, true}
+      "false" -> {:ok, false}
+      "0" -> {:ok, false}
+      _ -> {:error, :invalid_watch}
+    end
+  end
+
+  defp parse_bool_param(_value, _default), do: {:error, :invalid_watch}
+
+  defp parse_watch_timeout(nil), do: {:ok, :infinity}
+
+  defp parse_watch_timeout(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} when int >= 0 -> {:ok, int}
+      _ -> {:error, :invalid_watch}
+    end
+  end
+
+  defp parse_watch_timeout(_), do: {:error, :invalid_watch}
+
+  defp stream_watch(conn, watch, once?, timeout_ms) do
+    case chunk(conn, ": connected\n\n") do
+      {:ok, conn} ->
+        case chunk_watch_events(conn, watch.events) do
+          {:ok, conn} ->
+            if once? do
+              Toska.KVStore.unwatch(watch.ref)
+              conn
+            else
+              stream_watch_loop(conn, watch.ref, timeout_ms)
+            end
+
+          {:error, _reason} ->
+            Toska.KVStore.unwatch(watch.ref)
+            conn
+        end
+
+      {:error, _reason} ->
+        Toska.KVStore.unwatch(watch.ref)
+        conn
+    end
+  end
+
+  defp chunk_watch_events(conn, events) do
+    Enum.reduce_while(events, {:ok, conn}, fn event, {:ok, conn} ->
+      case chunk(conn, sse_event(event)) do
+        {:ok, conn} -> {:cont, {:ok, conn}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp stream_watch_loop(conn, ref, :infinity) do
+    receive do
+      {Toska.KVStore, :watch_event, ^ref, event} ->
+        case chunk(conn, sse_event(event)) do
+          {:ok, conn} ->
+            stream_watch_loop(conn, ref, :infinity)
+
+          {:error, _reason} ->
+            Toska.KVStore.unwatch(ref)
+            conn
+        end
+    end
+  end
+
+  defp stream_watch_loop(conn, ref, timeout_ms) do
+    receive do
+      {Toska.KVStore, :watch_event, ^ref, event} ->
+        case chunk(conn, sse_event(event)) do
+          {:ok, conn} ->
+            stream_watch_loop(conn, ref, timeout_ms)
+
+          {:error, _reason} ->
+            Toska.KVStore.unwatch(ref)
+            conn
+        end
+    after
+      timeout_ms ->
+        Toska.KVStore.unwatch(ref)
+        conn
+    end
+  end
+
+  defp sse_event(event) do
+    [
+      "id: ",
+      Integer.to_string(event.revision),
+      "\n",
+      "event: ",
+      event.op,
+      "\n",
+      "data: ",
+      Jason.encode!(event),
+      "\n\n"
+    ]
+  end
 
   defp file_size(path) do
     case File.stat(path) do

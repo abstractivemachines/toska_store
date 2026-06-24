@@ -16,10 +16,18 @@ defmodule Toska.ConfigManager do
   @config_file "toska_config.json"
 
   # Keys cached in persistent_term for hot-path access (avoid GenServer calls per request)
-  @cached_keys ["auth_token", "replication_auth_token", "rate_limit_per_sec", "rate_limit_burst", "replica_url", "max_body_size"]
+  @cached_keys [
+    "auth_token",
+    "replication_auth_token",
+    "rate_limit_per_sec",
+    "rate_limit_burst",
+    "replica_url",
+    "max_body_size"
+  ]
   @default_sync_interval_ms 1000
   @default_snapshot_interval_ms 60_000
   @default_ttl_check_interval_ms 1000
+  @default_watch_history_limit 10_000
 
   # Client API
 
@@ -358,11 +366,28 @@ defmodule Toska.ConfigManager do
   defp update_cache(config) do
     # Cache hot-path values in persistent_term for lock-free reads
     :persistent_term.put({__MODULE__, :auth_token}, config["auth_token"] || "")
-    :persistent_term.put({__MODULE__, :replication_auth_token}, config["replication_auth_token"] || "")
-    :persistent_term.put({__MODULE__, :rate_limit_per_sec}, parse_int_or_default(config["rate_limit_per_sec"], 0))
-    :persistent_term.put({__MODULE__, :rate_limit_burst}, parse_int_or_default(config["rate_limit_burst"], 0))
+
+    :persistent_term.put(
+      {__MODULE__, :replication_auth_token},
+      config["replication_auth_token"] || ""
+    )
+
+    :persistent_term.put(
+      {__MODULE__, :rate_limit_per_sec},
+      parse_int_or_default(config["rate_limit_per_sec"], 0)
+    )
+
+    :persistent_term.put(
+      {__MODULE__, :rate_limit_burst},
+      parse_int_or_default(config["rate_limit_burst"], 0)
+    )
+
     :persistent_term.put({__MODULE__, :replica_url}, config["replica_url"] || "")
-    :persistent_term.put({__MODULE__, :max_body_size}, parse_int_or_default(config["max_body_size"], 10_485_760))
+
+    :persistent_term.put(
+      {__MODULE__, :max_body_size},
+      parse_int_or_default(config["max_body_size"], 10_485_760)
+    )
   end
 
   defp load_config(file_path) do
@@ -397,7 +422,9 @@ defmodule Toska.ConfigManager do
         case File.write(file_path, json) do
           :ok ->
             case File.chmod(file_path, 0o600) do
-              :ok -> :ok
+              :ok ->
+                :ok
+
               {:error, reason} ->
                 Logger.warning("Failed to chmod config file: #{inspect(reason)}")
                 :ok
@@ -451,6 +478,9 @@ defmodule Toska.ConfigManager do
         validate_positive_int(value)
 
       "compaction_aof_bytes" ->
+        validate_positive_int(value)
+
+      "watch_history_limit" ->
         validate_positive_int(value)
 
       "replica_url" ->
@@ -579,6 +609,7 @@ defmodule Toska.ConfigManager do
       "ttl_check_interval_ms" => @default_ttl_check_interval_ms,
       "compaction_interval_ms" => 300_000,
       "compaction_aof_bytes" => 10_485_760,
+      "watch_history_limit" => @default_watch_history_limit,
       "replica_url" => "",
       "replica_poll_interval_ms" => 1000,
       "replica_http_timeout_ms" => 5000,

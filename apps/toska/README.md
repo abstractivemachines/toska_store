@@ -171,6 +171,7 @@ When the server is running, the HTTP API provides a simple JSON key/value store:
 - `DELETE /kv/:key` - Remove a key
 - `POST /kv/mget` - Fetch multiple keys (`{"keys": ["a", "b"]}`)
 - `POST /kv/txn` - Atomically compare keys and apply a success or failure operation list
+- `GET /kv/watch?prefix=&since_revision=0` - Server-Sent Events stream for key changes
 - `GET /stats` - Store metrics and persistence info
 - `GET /replication/info` - Snapshot + AOF metadata for followers
 - `GET /replication/snapshot` - JSON snapshot file
@@ -188,6 +189,12 @@ KV endpoints (`/kv/*` and `/stats`) can require an auth token and apply rate lim
 `PUT /kv/:key` accepts optional `if_version`, `if_absent`, and `if_present` fields. `DELETE /kv/:key` accepts `if_version` as a query parameter. `PUT` and `DELETE` also accept `If-Match: "<version>"`; failed conditions return `412`.
 
 `POST /kv/txn` accepts `compare`, `success`, and `failure` arrays. Compares support `version`, `exists`, and `value`; operations support `put`, `delete`, and `get`. The selected operation list runs atomically inside the KV store.
+
+`GET /kv/watch` streams `put`, `delete`, and `expire` events as Server-Sent Events. Use `prefix` to filter keys and `since_revision` to replay retained history after a known store revision. Watch replay is available from the current AOF/revision window and in-memory history; requests older than retained history return `409`.
+
+```bash
+curl -N "http://localhost:4000/kv/watch?prefix=jobs:&since_revision=0"
+```
 
 `GET /kv/keys` returns `{"keys": [...], "next_cursor": "..."}`. When `next_cursor` is present, pass it back as `cursor` with the same `prefix` to fetch the next page. `limit` defaults to `100`, may be `0`, and cannot exceed `1000`.
 
@@ -210,6 +217,7 @@ Set `TOSKA_DATA_DIR` to override the data directory for AOF/snapshot files.
 - **ttl_check_interval_ms** (integer): TTL cleanup interval (default: 1000)
 - **compaction_interval_ms** (integer): AOF compaction interval (default: 300000)
 - **compaction_aof_bytes** (integer): AOF size threshold for compaction (default: 10485760)
+- **watch_history_limit** (integer): Maximum in-memory watch events retained for replay (default: 10000)
 - **replica_url** (string): Leader URL for follower replication (default: empty)
 - **replica_poll_interval_ms** (integer): Follower poll interval (default: 1000)
 - **replica_http_timeout_ms** (integer): Follower HTTP timeout (default: 5000)

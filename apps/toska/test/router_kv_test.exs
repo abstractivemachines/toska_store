@@ -193,6 +193,62 @@ defmodule Toska.RouterKVTest do
     assert Jason.decode!(conn.resp_body)["error"] == "Invalid transaction"
   end
 
+  test "watch streams replay events as server-sent events" do
+    :ok = Toska.KVStore.put("sse:a", "1")
+    :ok = Toska.KVStore.put("other:a", "skip")
+    :ok = Toska.KVStore.delete("sse:a")
+
+    conn =
+      conn("GET", "/kv/watch?prefix=sse:&since_revision=0&once=true")
+      |> Toska.Router.call(@opts)
+
+    assert conn.status == 200
+    assert get_resp_header(conn, "content-type") == ["text/event-stream; charset=utf-8"]
+    assert get_resp_header(conn, "x-toska-revision") == ["3"]
+    assert conn.resp_body =~ ": connected"
+    assert conn.resp_body =~ "event: put"
+    assert conn.resp_body =~ "event: delete"
+
+    events = sse_events(conn.resp_body)
+    assert Enum.map(events, & &1["op"]) == ["put", "delete"]
+    assert Enum.map(events, & &1["key"]) == ["sse:a", "sse:a"]
+    assert Enum.map(events, & &1["revision"]) == [1, 3]
+  end
+
+  test "watch streams live events until timeout" do
+    task =
+      Task.async(fn ->
+        conn("GET", "/kv/watch?prefix=live-http:&timeout_ms=100")
+        |> Toska.Router.call(@opts)
+      end)
+
+    wait_until(fn ->
+      case Toska.KVStore.stats() do
+        {:ok, stats} -> stats.watchers == 1
+        _ -> false
+      end
+    end)
+
+    :ok = Toska.KVStore.put("live-http:key", "1")
+
+    conn = Task.await(task, 1000)
+    assert conn.status == 200
+
+    [event] = sse_events(conn.resp_body)
+    assert event["op"] == "put"
+    assert event["key"] == "live-http:key"
+    assert event["value"] == "1"
+  end
+
+  test "watch rejects invalid revisions" do
+    conn =
+      conn("GET", "/kv/watch?since_revision=bad&once=true")
+      |> Toska.Router.call(@opts)
+
+    assert conn.status == 400
+    assert Jason.decode!(conn.resp_body)["error"] == "Invalid watch parameters"
+  end
+
   test "root endpoint returns html" do
     conn =
       conn("GET", "/")
@@ -613,6 +669,25 @@ defmodule Toska.RouterKVTest do
   defp put_replication_auth(conn) do
     put_req_header(conn, "authorization", "Bearer #{@replication_token}")
   end
+
+  defp sse_events(body) do
+    ~r/^data: (.+)$/m
+    |> Regex.scan(body)
+    |> Enum.map(fn [_line, json] -> Jason.decode!(json) end)
+  end
+
+  defp wait_until(fun, attempts \\ 20)
+
+  defp wait_until(fun, attempts) when attempts > 0 do
+    if fun.() do
+      :ok
+    else
+      Process.sleep(10)
+      wait_until(fun, attempts - 1)
+    end
+  end
+
+  defp wait_until(_fun, 0), do: flunk("condition was not met in time")
 
   defp stop_store do
     case GenServer.whereis(Toska.KVStore) do
