@@ -15,6 +15,7 @@ defmodule Toska.KVStore do
   @default_ttl_check_interval_ms 1000
   @default_compaction_interval_ms 300_000
   @default_compaction_aof_bytes 10_485_760
+  @default_watch_history_limit 10_000
   @default_aof_file "toska.aof"
   @default_snapshot_file "toska_snapshot.json"
   @snapshot_version 1
@@ -189,6 +190,23 @@ defmodule Toska.KVStore do
 
   def txn(_, _, _), do: {:error, :invalid_transaction}
 
+  def watch(prefix \\ "", since_revision \\ nil, opts \\ [])
+
+  def watch(prefix, since_revision, opts) when is_binary(prefix) and is_list(opts) do
+    with {:ok, since_revision} <- normalize_since_revision(since_revision) do
+      pid = Keyword.get(opts, :pid, self())
+      call_store({:watch, prefix, since_revision, pid})
+    end
+  end
+
+  def watch(_, _, _), do: {:error, :invalid_watch}
+
+  def unwatch(ref) when is_reference(ref) do
+    call_store({:unwatch, ref})
+  end
+
+  def unwatch(_), do: {:error, :invalid_watch}
+
   def stats do
     case GenServer.whereis(__MODULE__) do
       nil -> {:error, :not_running}
@@ -264,7 +282,8 @@ defmodule Toska.KVStore do
     File.mkdir_p!(config.data_dir)
 
     snapshot_meta = load_snapshot(config.snapshot_path)
-    replay_aof(config.aof_path)
+    snapshot_revision = (snapshot_meta && snapshot_meta.store_revision) || 0
+    aof_meta = replay_aof(config.aof_path, snapshot_revision, config.watch_history_limit)
 
     {:ok, aof_io} = File.open(config.aof_path, [:append, :utf8])
 
@@ -274,6 +293,9 @@ defmodule Toska.KVStore do
       |> Map.put(:last_snapshot_at, snapshot_meta && snapshot_meta.created_at)
       |> Map.put(:last_snapshot_checksum, snapshot_meta && snapshot_meta.checksum)
       |> Map.put(:last_sync_at, nil)
+      |> Map.put(:revision, aof_meta.revision)
+      |> Map.put(:watch_events, aof_meta.events)
+      |> Map.put(:watchers, %{})
 
     schedule_sync(state)
     schedule_snapshot(state)
@@ -292,16 +314,15 @@ defmodule Toska.KVStore do
     current = current_entry(key, now)
 
     if conditions_met?(current, conditions) do
-      if expires_at == :expired do
-        :ets.delete(@table, key)
-        append_aof(state, %{op: "del", key: key})
-        {:reply, :ok, maybe_sync(state)}
-      else
-        entry = next_entry(key, value, expires_at, current, now)
-        insert_entry(entry)
-        append_aof(state, set_record(entry))
-        {:reply, :ok, maybe_sync(state)}
-      end
+      state =
+        if expires_at == :expired do
+          delete_entry(state, key, current, now, "delete")
+        else
+          entry = next_entry(key, value, expires_at, current, now)
+          put_entry(state, entry, now)
+        end
+
+      {:reply, :ok, maybe_sync(state)}
     else
       {:reply, {:error, :condition_failed}, state}
     end
@@ -312,8 +333,7 @@ defmodule Toska.KVStore do
     current = current_entry(key, now)
 
     if conditions_met?(current, conditions) do
-      :ets.delete(@table, key)
-      append_aof(state, %{op: "del", key: key})
+      state = delete_entry(state, key, current, now, "delete")
       {:reply, :ok, maybe_sync(state)}
     else
       {:reply, {:error, :condition_failed}, state}
@@ -324,8 +344,9 @@ defmodule Toska.KVStore do
     now = now_ms()
     succeeded = Enum.all?(txn.compare, &compare_met?(&1, now))
     ops = if succeeded, do: txn.success, else: txn.failure
-    {responses, wrote?} = apply_txn_ops(ops, state, now)
-    state = if wrote?, do: maybe_sync(state), else: state
+    initial_revision = state.revision
+    {responses, state} = apply_txn_ops(ops, state, now)
+    state = if state.revision != initial_revision, do: maybe_sync(state), else: state
 
     {:reply, {:ok, %{succeeded: succeeded, responses: responses}}, state}
   end
@@ -353,6 +374,10 @@ defmodule Toska.KVStore do
       ttl_check_interval_ms: state.ttl_check_interval_ms,
       compaction_interval_ms: state.compaction_interval_ms,
       compaction_aof_bytes: state.compaction_aof_bytes,
+      revision: state.revision,
+      watch_history_size: length(state.watch_events),
+      watch_history_limit: state.watch_history_limit,
+      watchers: map_size(state.watchers),
       last_snapshot_at: state.last_snapshot_at,
       last_sync_at: state.last_sync_at
     }
@@ -361,7 +386,7 @@ defmodule Toska.KVStore do
   end
 
   def handle_call(:snapshot, _from, state) do
-    case write_snapshot(state.snapshot_path) do
+    case write_snapshot(state) do
       {:ok, checksum} ->
         state = reset_aof(state)
         {:reply, :ok, %{state | last_snapshot_at: now_ms(), last_snapshot_checksum: checksum}}
@@ -388,7 +413,8 @@ defmodule Toska.KVStore do
       snapshot_version: @snapshot_version,
       aof_path: state.aof_path,
       aof_size: file_size(state.aof_path),
-      aof_version: @aof_version
+      aof_version: @aof_version,
+      store_revision: state.revision
     }
 
     {:reply, {:ok, info}, state}
@@ -420,11 +446,13 @@ defmodule Toska.KVStore do
       true ->
         :ets.delete_all_objects(@table)
         load_entries(data, now_ms())
+        store_revision = snapshot_store_revision(payload, state.revision)
+        updated = %{state | revision: store_revision, watch_events: []}
 
-        case write_snapshot(state.snapshot_path) do
+        case write_snapshot(updated) do
           {:ok, checksum} ->
-            state = reset_aof(state)
-            updated = %{state | last_snapshot_at: now_ms(), last_snapshot_checksum: checksum}
+            updated = reset_aof(updated)
+            updated = %{updated | last_snapshot_at: now_ms(), last_snapshot_checksum: checksum}
             {:reply, :ok, updated}
 
           {:error, reason} ->
@@ -436,14 +464,46 @@ defmodule Toska.KVStore do
   def handle_call({:apply_replication, records}, _from, state) do
     now = now_ms()
 
-    Enum.each(records, fn record ->
-      if valid_aof_checksum?(record) do
-        apply_aof_record(record, now)
-        append_aof(state, record)
-      end
-    end)
+    state =
+      Enum.reduce(records, state, fn record, state ->
+        if valid_aof_checksum?(record) do
+          apply_replicated_record(record, state, now)
+        else
+          state
+        end
+      end)
 
     {:reply, :ok, maybe_sync(state)}
+  end
+
+  def handle_call({:watch, prefix, since_revision, pid}, _from, state) do
+    case watch_replay(state, prefix, since_revision) do
+      {:ok, events} ->
+        ref = make_ref()
+        monitor = Process.monitor(pid)
+
+        watchers =
+          Map.put(state.watchers, ref, %{
+            pid: pid,
+            prefix: prefix,
+            monitor: monitor
+          })
+
+        reply = %{
+          ref: ref,
+          current_revision: state.revision,
+          events: events
+        }
+
+        {:reply, {:ok, reply}, %{state | watchers: watchers}}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:unwatch, ref}, _from, state) do
+    {:reply, :ok, remove_watcher(state, ref)}
   end
 
   @impl true
@@ -455,7 +515,7 @@ defmodule Toska.KVStore do
 
   def handle_info(:snapshot, state) do
     state =
-      case write_snapshot(state.snapshot_path) do
+      case write_snapshot(state) do
         {:ok, checksum} ->
           reset_aof(%{
             state
@@ -473,7 +533,7 @@ defmodule Toska.KVStore do
   end
 
   def handle_info(:ttl_cleanup, state) do
-    cleanup_expired(now_ms())
+    state = cleanup_expired(now_ms(), state)
     schedule_ttl_cleanup(state)
     {:noreply, state}
   end
@@ -482,6 +542,15 @@ defmodule Toska.KVStore do
     state = maybe_compact(state, false)
     schedule_compaction(state)
     {:noreply, state}
+  end
+
+  def handle_info({:DOWN, monitor, :process, _pid, _reason}, state) do
+    watchers =
+      state.watchers
+      |> Enum.reject(fn {_ref, watcher} -> watcher.monitor == monitor end)
+      |> Map.new()
+
+    {:noreply, %{state | watchers: watchers}}
   end
 
   @impl true
@@ -511,7 +580,6 @@ defmodule Toska.KVStore do
     case :ets.lookup(@table, key) do
       [{^key, value, expires_at, version, created_at, updated_at}] ->
         if expired?(expires_at, now) do
-          :ets.delete(@table, key)
           {:error, :not_found}
         else
           {:ok, entry(key, value, expires_at, version, created_at, updated_at)}
@@ -519,7 +587,6 @@ defmodule Toska.KVStore do
 
       [{^key, value, expires_at}] ->
         if expired?(expires_at, now) do
-          :ets.delete(@table, key)
           {:error, :not_found}
         else
           {:ok, entry(key, value, expires_at, 1, now, now)}
@@ -564,7 +631,7 @@ defmodule Toska.KVStore do
     )
   end
 
-  defp set_record(entry) do
+  defp set_record(entry, revision) do
     %{
       op: "set",
       key: entry.key,
@@ -572,7 +639,8 @@ defmodule Toska.KVStore do
       expires_at: entry.expires_at,
       version: entry.version,
       created_at: entry.created_at,
-      updated_at: entry.updated_at
+      updated_at: entry.updated_at,
+      revision: revision
     }
   end
 
@@ -671,6 +739,18 @@ defmodule Toska.KVStore do
   end
 
   defp normalize_version(_), do: {:error, :invalid_conditions}
+
+  defp normalize_since_revision(nil), do: {:ok, nil}
+  defp normalize_since_revision(value) when is_integer(value) and value >= 0, do: {:ok, value}
+
+  defp normalize_since_revision(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} when int >= 0 -> {:ok, int}
+      _ -> {:error, :invalid_watch}
+    end
+  end
+
+  defp normalize_since_revision(_), do: {:error, :invalid_watch}
 
   defp conditions_met?(current, conditions) do
     absent_ok = not conditions.if_absent or is_nil(current)
@@ -813,9 +893,8 @@ defmodule Toska.KVStore do
   end
 
   defp apply_txn_ops(ops, state, now) do
-    Enum.map_reduce(ops, false, fn op, wrote? ->
-      {result, op_wrote?} = apply_txn_op(op, state, now)
-      {result, wrote? or op_wrote?}
+    Enum.map_reduce(ops, state, fn op, state ->
+      apply_txn_op(op, state, now)
     end)
   end
 
@@ -823,27 +902,26 @@ defmodule Toska.KVStore do
     expires_at = normalize_ttl(op.ttl_ms, now)
 
     if expires_at == :expired do
-      :ets.delete(@table, op.key)
-      append_aof(state, %{op: "del", key: op.key})
-      {%{op: "put", key: op.key, deleted: true}, true}
+      current = current_entry(op.key, now)
+      state = delete_entry(state, op.key, current, now, "delete")
+      {%{op: "put", key: op.key, deleted: not is_nil(current)}, state}
     else
       entry = next_entry(op.key, op.value, expires_at, current_entry(op.key, now), now)
-      insert_entry(entry)
-      append_aof(state, set_record(entry))
-      {Map.put(entry_result(entry), :op, "put"), true}
+      state = put_entry(state, entry, now)
+      {Map.put(entry_result(entry), :op, "put"), state}
     end
   end
 
-  defp apply_txn_op(%{op: :delete, key: key}, state, _now) do
-    :ets.delete(@table, key)
-    append_aof(state, %{op: "del", key: key})
-    {%{op: "delete", key: key, deleted: true}, true}
+  defp apply_txn_op(%{op: :delete, key: key}, state, now) do
+    current = current_entry(key, now)
+    state = delete_entry(state, key, current, now, "delete")
+    {%{op: "delete", key: key, deleted: not is_nil(current)}, state}
   end
 
-  defp apply_txn_op(%{op: :get, key: key}, _state, now) do
+  defp apply_txn_op(%{op: :get, key: key}, state, now) do
     case current_entry(key, now) do
-      nil -> {%{op: "get", key: key, found: false, value: nil}, false}
-      entry -> {entry |> entry_result() |> Map.put(:op, "get") |> Map.put(:found, true), false}
+      nil -> {%{op: "get", key: key, found: false, value: nil}, state}
+      entry -> {entry |> entry_result() |> Map.put(:op, "get") |> Map.put(:found, true), state}
     end
   end
 
@@ -860,17 +938,135 @@ defmodule Toska.KVStore do
     }
   end
 
-  defp cleanup_expired(now) do
+  defp put_entry(state, entry, now) do
+    revision = next_revision(state)
+
+    insert_entry(entry)
+    append_aof(state, set_record(entry, revision))
+
+    state
+    |> Map.put(:revision, revision)
+    |> publish_event(put_event(entry, revision, now))
+  end
+
+  defp delete_entry(state, _key, nil, _now, _event_op), do: state
+
+  defp delete_entry(state, key, current, now, event_op) do
+    revision = next_revision(state)
+    aof_op = if event_op == "expire", do: "expire", else: "del"
+
+    :ets.delete(@table, key)
+    append_aof(state, %{op: aof_op, key: key, revision: revision})
+
+    state
+    |> Map.put(:revision, revision)
+    |> publish_event(delete_event(event_op, key, current, revision, now))
+  end
+
+  defp next_revision(state), do: state.revision + 1
+
+  defp put_event(entry, revision, now) do
+    entry
+    |> entry_result()
+    |> Map.merge(%{
+      op: "put",
+      revision: revision,
+      timestamp: now
+    })
+  end
+
+  defp delete_event(op, key, current, revision, now) do
+    %{
+      op: op,
+      key: key,
+      value: nil,
+      metadata: entry_result(current).metadata,
+      revision: revision,
+      timestamp: now
+    }
+  end
+
+  defp publish_event(state, event) do
+    Enum.each(state.watchers, fn {ref, watcher} ->
+      if matches_prefix?(event.key, watcher.prefix) do
+        send(watcher.pid, {__MODULE__, :watch_event, ref, event})
+      end
+    end)
+
+    %{
+      state
+      | watch_events: store_watch_event(state.watch_events, event, state.watch_history_limit)
+    }
+  end
+
+  defp store_watch_event(events, event, limit) do
+    events
+    |> Kernel.++([event])
+    |> trim_watch_events(limit)
+  end
+
+  defp trim_watch_events(events, limit) do
+    count = length(events)
+
+    if count > limit do
+      Enum.drop(events, count - limit)
+    else
+      events
+    end
+  end
+
+  defp watch_replay(_state, _prefix, nil), do: {:ok, []}
+
+  defp watch_replay(state, prefix, since_revision) do
+    oldest_available =
+      case state.watch_events do
+        [first | _] -> first.revision
+        [] -> state.revision + 1
+      end
+
+    cond do
+      since_revision > state.revision ->
+        {:ok, []}
+
+      since_revision < state.revision and since_revision < oldest_available - 1 ->
+        {:error, :history_unavailable}
+
+      true ->
+        events =
+          state.watch_events
+          |> Enum.filter(&(&1.revision > since_revision))
+          |> Enum.filter(&matches_prefix?(&1.key, prefix))
+
+        {:ok, events}
+    end
+  end
+
+  defp remove_watcher(state, ref) do
+    case Map.pop(state.watchers, ref) do
+      {nil, _watchers} ->
+        state
+
+      {watcher, watchers} ->
+        Process.demonitor(watcher.monitor, [:flush])
+        %{state | watchers: watchers}
+    end
+  end
+
+  defp cleanup_expired(now, state) do
     match_spec = [
       {
         {:"$1", :"$2", :"$3", :"$4", :"$5", :"$6"},
         [{:is_integer, :"$3"}, {:"=<", :"$3", now}],
-        [:"$1"]
+        [{{:"$1", :"$2", :"$3", :"$4", :"$5", :"$6"}}]
       }
     ]
 
     :ets.select(@table, match_spec)
-    |> Enum.each(&:ets.delete(@table, &1))
+    |> Enum.reduce(state, fn {key, value, expires_at, version, created_at, updated_at}, state ->
+      current = entry(key, value, expires_at, version, created_at, updated_at)
+      delete_entry(state, key, current, now, "expire")
+    end)
+    |> maybe_sync()
   end
 
   defp load_snapshot(path) do
@@ -885,7 +1081,8 @@ defmodule Toska.KVStore do
 
               %{
                 checksum: Map.get(payload, "checksum"),
-                created_at: Map.get(payload, "created_at")
+                created_at: Map.get(payload, "created_at"),
+                store_revision: snapshot_store_revision(payload, 0)
               }
             else
               Logger.warning("Snapshot checksum mismatch, skipping load")
@@ -933,36 +1130,43 @@ defmodule Toska.KVStore do
     end)
   end
 
-  defp replay_aof(path) do
+  defp replay_aof(path, start_revision, history_limit) do
+    initial = %{revision: start_revision, events: []}
+
     case File.open(path, [:read]) do
       {:ok, io} ->
         now = now_ms()
 
-        io
-        |> IO.stream(:line)
-        |> Stream.map(&String.trim/1)
-        |> Stream.reject(&(&1 == ""))
-        |> Enum.each(fn line ->
-          case Jason.decode(line) do
-            {:ok, record} ->
-              if valid_aof_checksum?(record) do
-                apply_aof_record(record, now)
-              else
-                Logger.warning("Skipping AOF entry with invalid checksum")
-              end
+        result =
+          io
+          |> IO.stream(:line)
+          |> Stream.map(&String.trim/1)
+          |> Stream.reject(&(&1 == ""))
+          |> Enum.reduce(initial, fn line, acc ->
+            case Jason.decode(line) do
+              {:ok, record} ->
+                if valid_aof_checksum?(record) do
+                  replay_aof_record(record, acc, now, history_limit)
+                else
+                  Logger.warning("Skipping AOF entry with invalid checksum")
+                  acc
+                end
 
-            {:error, reason} ->
-              Logger.warning("Skipping invalid AOF line: #{inspect(reason)}")
-          end
-        end)
+              {:error, reason} ->
+                Logger.warning("Skipping invalid AOF line: #{inspect(reason)}")
+                acc
+            end
+          end)
 
         File.close(io)
+        result
 
       {:error, :enoent} ->
-        :ok
+        initial
 
       {:error, reason} ->
         Logger.warning("Failed to read AOF: #{inspect(reason)}")
+        initial
     end
   end
 
@@ -1022,7 +1226,6 @@ defmodule Toska.KVStore do
       Enum.reduce(rows, acc, fn {key, expires_at}, acc ->
         cond do
           expired?(expires_at, now) ->
-            :ets.delete(@table, key)
             acc
 
           not matches_prefix?(key, prefix) ->
@@ -1063,7 +1266,7 @@ defmodule Toska.KVStore do
     end
   end
 
-  defp write_snapshot(path) do
+  defp write_snapshot(state) do
     now = now_ms()
 
     data =
@@ -1087,15 +1290,16 @@ defmodule Toska.KVStore do
     payload = %{
       "version" => @snapshot_version,
       "created_at" => now,
+      "store_revision" => state.revision,
       "checksum" => checksum,
       "data" => data
     }
 
-    tmp_path = path <> ".tmp"
+    tmp_path = state.snapshot_path <> ".tmp"
 
     with {:ok, json} <- Jason.encode(payload, pretty: true),
          :ok <- File.write(tmp_path, json),
-         :ok <- File.rename(tmp_path, path) do
+         :ok <- File.rename(tmp_path, state.snapshot_path) do
       {:ok, checksum}
     else
       {:error, reason} -> {:error, reason}
@@ -1138,7 +1342,7 @@ defmodule Toska.KVStore do
     aof_bytes = file_size(state.aof_path)
 
     if force or aof_bytes >= state.compaction_aof_bytes do
-      case write_snapshot(state.snapshot_path) do
+      case write_snapshot(state) do
         {:ok, checksum} ->
           reset_aof(%{
             state
@@ -1188,7 +1392,8 @@ defmodule Toska.KVStore do
       snapshot_interval_ms: @default_snapshot_interval_ms,
       ttl_check_interval_ms: @default_ttl_check_interval_ms,
       compaction_interval_ms: @default_compaction_interval_ms,
-      compaction_aof_bytes: @default_compaction_aof_bytes
+      compaction_aof_bytes: @default_compaction_aof_bytes,
+      watch_history_limit: @default_watch_history_limit
     }
 
     config =
@@ -1221,7 +1426,8 @@ defmodule Toska.KVStore do
       compaction_interval_ms:
         parse_int(config["compaction_interval_ms"], defaults.compaction_interval_ms),
       compaction_aof_bytes:
-        parse_int(config["compaction_aof_bytes"], defaults.compaction_aof_bytes)
+        parse_int(config["compaction_aof_bytes"], defaults.compaction_aof_bytes),
+      watch_history_limit: parse_int(config["watch_history_limit"], defaults.watch_history_limit)
     }
   end
 
@@ -1281,6 +1487,57 @@ defmodule Toska.KVStore do
   defp normalize_stored_timestamp(value, _default) when is_integer(value) and value > 0, do: value
   defp normalize_stored_timestamp(_value, default), do: default
 
+  defp snapshot_store_revision(payload, default) do
+    normalize_store_revision(Map.get(payload, "store_revision"), default)
+  end
+
+  defp normalize_store_revision(value, _default) when is_integer(value) and value >= 0, do: value
+
+  defp normalize_store_revision(value, default) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} when int >= 0 -> int
+      _ -> default
+    end
+  end
+
+  defp normalize_store_revision(_value, default), do: default
+
+  defp replay_aof_record(record, acc, now, history_limit) do
+    revision = record_revision(record, acc.revision + 1)
+    record = Map.put(record, "revision", revision)
+
+    apply_aof_record(record, now)
+
+    events =
+      case event_from_aof_record(record, now) do
+        nil -> acc.events
+        event -> store_watch_event(acc.events, event, history_limit)
+      end
+
+    %{revision: max(acc.revision, revision), events: events}
+  end
+
+  defp apply_replicated_record(record, state, now) do
+    revision = record_revision(record, state.revision + 1)
+    record = Map.put(record, "revision", revision)
+
+    apply_aof_record(record, now)
+    append_aof(state, record)
+
+    state = %{state | revision: max(state.revision, revision)}
+
+    case event_from_aof_record(record, now) do
+      nil -> state
+      event -> publish_event(state, event)
+    end
+  end
+
+  defp record_revision(record, default) do
+    record
+    |> Map.get("revision", Map.get(record, :revision))
+    |> normalize_store_revision(default)
+  end
+
   defp apply_aof_record(%{"op" => "set", "key" => key, "value" => value} = record, now) do
     expires_at = Map.get(record, "expires_at")
 
@@ -1307,7 +1564,50 @@ defmodule Toska.KVStore do
     :ets.delete(@table, key)
   end
 
+  defp apply_aof_record(%{"op" => "expire", "key" => key}, _now) do
+    :ets.delete(@table, key)
+  end
+
   defp apply_aof_record(_record, _now), do: :ok
+
+  defp event_from_aof_record(%{"op" => "set", "key" => _key, "value" => _value} = record, now) do
+    expires_at = Map.get(record, "expires_at")
+
+    if expired?(expires_at, now) do
+      nil
+    else
+      revision = record_revision(record, 0)
+
+      entry =
+        entry(
+          Map.get(record, "key"),
+          Map.get(record, "value"),
+          expires_at,
+          normalize_stored_version(Map.get(record, "version")),
+          normalize_stored_timestamp(Map.get(record, "created_at"), now),
+          normalize_stored_timestamp(Map.get(record, "updated_at"), now)
+        )
+
+      put_event(entry, revision, now)
+    end
+  end
+
+  defp event_from_aof_record(%{"op" => op, "key" => key} = record, now)
+       when op in ["del", "expire"] do
+    event_op = if op == "expire", do: "expire", else: "delete"
+    revision = record_revision(record, 0)
+
+    %{
+      op: event_op,
+      key: key,
+      value: nil,
+      metadata: nil,
+      revision: revision,
+      timestamp: now
+    }
+  end
+
+  defp event_from_aof_record(_record, _now), do: nil
 
   defp normalize_aof_record(record) do
     base =

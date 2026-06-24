@@ -83,6 +83,7 @@ defmodule Toska.Commands.Config do
       ttl_check_interval_ms TTL cleanup interval (milliseconds)
       compaction_interval_ms AOF compaction interval (milliseconds)
       compaction_aof_bytes AOF size threshold for compaction (bytes)
+      watch_history_limit Maximum in-memory watch events retained for replay
       replica_url Leader URL for replication follower
       replica_poll_interval_ms Follower poll interval (milliseconds)
       replica_http_timeout_ms Follower HTTP timeout (milliseconds)
