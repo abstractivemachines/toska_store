@@ -249,6 +249,105 @@ defmodule Toska.RouterKVTest do
     assert Jason.decode!(conn.resp_body)["error"] == "Invalid watch parameters"
   end
 
+  test "leases can attach keys and be renewed over HTTP" do
+    create_conn =
+      conn("POST", "/leases", Jason.encode!(%{id: "http-lease", ttl_ms: 1_000}))
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert create_conn.status == 201
+    lease = Jason.decode!(create_conn.resp_body)["lease"]
+    assert lease["id"] == "http-lease"
+
+    put_conn =
+      conn("PUT", "/kv/http-leased", Jason.encode!(%{value: "v", lease_id: "http-lease"}))
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert put_conn.status == 200
+    put_body = Jason.decode!(put_conn.resp_body)
+    assert put_body["metadata"]["lease_id"] == "http-lease"
+    assert put_body["metadata"]["expires_at"] == lease["expires_at"]
+
+    :timer.sleep(2)
+
+    keepalive_conn =
+      conn("POST", "/leases/http-lease/keepalive")
+      |> Toska.Router.call(@opts)
+
+    assert keepalive_conn.status == 200
+    renewed = Jason.decode!(keepalive_conn.resp_body)["lease"]
+    assert renewed["expires_at"] > lease["expires_at"]
+
+    delete_conn =
+      conn("DELETE", "/leases/http-lease")
+      |> Toska.Router.call(@opts)
+
+    assert delete_conn.status == 200
+
+    missing_conn =
+      conn("GET", "/kv/http-leased")
+      |> Toska.Router.call(@opts)
+
+    assert missing_conn.status == 404
+  end
+
+  test "lock acquire and release enforce lease ownership over HTTP" do
+    for id <- ["http-lock-owner", "http-lock-contender"] do
+      conn =
+        conn("POST", "/leases", Jason.encode!(%{id: id, ttl_ms: 5_000}))
+        |> put_req_header("content-type", "application/json")
+        |> Toska.Router.call(@opts)
+
+      assert conn.status == 201
+    end
+
+    acquire_conn =
+      conn(
+        "POST",
+        "/locks/http-lock/acquire",
+        Jason.encode!(%{lease_id: "http-lock-owner", holder: "worker"})
+      )
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert acquire_conn.status == 200
+
+    assert get_in(Jason.decode!(acquire_conn.resp_body), ["lock", "lease_id"]) ==
+             "http-lock-owner"
+
+    conflict_conn =
+      conn("POST", "/locks/http-lock/acquire", Jason.encode!(%{lease_id: "http-lock-contender"}))
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert conflict_conn.status == 409
+
+    mismatch_conn =
+      conn("POST", "/locks/http-lock/release", Jason.encode!(%{lease_id: "http-lock-contender"}))
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert mismatch_conn.status == 409
+
+    release_conn =
+      conn("POST", "/locks/http-lock/release", Jason.encode!(%{lease_id: "http-lock-owner"}))
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert release_conn.status == 200
+  end
+
+  test "PUT with a missing lease returns 404" do
+    conn =
+      conn("PUT", "/kv/missing-lease", Jason.encode!(%{value: "v", lease_id: "missing"}))
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert conn.status == 404
+    assert Jason.decode!(conn.resp_body)["error"] == "Lease not found"
+  end
+
   test "root endpoint returns html" do
     conn =
       conn("GET", "/")
@@ -580,6 +679,20 @@ defmodule Toska.RouterKVTest do
       |> Toska.Router.call(@opts)
 
     assert txn_conn.status == 403
+
+    lease_conn =
+      conn("POST", "/leases", Jason.encode!(%{id: "readonly-lease", ttl_ms: 1_000}))
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert lease_conn.status == 403
+
+    lock_conn =
+      conn("POST", "/locks/readonly/acquire", Jason.encode!(%{lease_id: "readonly-lease"}))
+      |> put_req_header("content-type", "application/json")
+      |> Toska.Router.call(@opts)
+
+    assert lock_conn.status == 403
 
     read_conn =
       conn("GET", "/kv/readonly")

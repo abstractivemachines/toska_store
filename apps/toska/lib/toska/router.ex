@@ -91,6 +91,8 @@ defmodule Toska.Router do
         <li>/kv/&lt;key&gt; - GET/PUT/DELETE key/value</li>
         <li>/kv/mget - POST body {"keys": ["a", "b"]}</li>
         <li>/kv/watch?prefix=&amp;since_revision=0 - Server-Sent Events key change feed</li>
+        <li>/leases - POST to create, DELETE /leases/&lt;id&gt; to revoke</li>
+        <li>/locks/&lt;name&gt;/acquire - POST to acquire a lease-backed lock</li>
         <li><a href="/replication/info">/replication/info</a> - Replication metadata</li>
         <li><a href="/replication/status">/replication/status</a> - Follower status</li>
         <li><a href="/replication/snapshot">/replication/snapshot</a> - Snapshot file</li>
@@ -420,6 +422,163 @@ defmodule Toska.Router do
     end
   end
 
+  # POST /leases - create a lease with ttl_ms and optional id
+  post "/leases" do
+    case Toska.KVStore.create_lease(conn.body_params["ttl_ms"], %{
+           id: conn.body_params["id"]
+         }) do
+      {:ok, lease} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(201, Jason.encode!(%{ok: true, lease: lease}))
+
+      {:error, :invalid_lease} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(400, Jason.encode!(%{error: "Invalid lease"}))
+
+      {:error, :lease_exists} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(409, Jason.encode!(%{error: "Lease already exists"}))
+
+      {:error, reason} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)})
+        )
+    end
+  end
+
+  # POST /leases/:id/keepalive - renew a lease to now + ttl_ms
+  post "/leases/:id/keepalive" do
+    case Toska.KVStore.keepalive_lease(id) do
+      {:ok, lease} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{ok: true, lease: lease}))
+
+      {:error, :invalid_lease} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(400, Jason.encode!(%{error: "Invalid lease"}))
+
+      {:error, :lease_not_found} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(404, Jason.encode!(%{error: "Lease not found", id: id}))
+
+      {:error, reason} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)})
+        )
+    end
+  end
+
+  # DELETE /leases/:id - revoke a lease and remove attached keys/locks
+  delete "/leases/:id" do
+    case Toska.KVStore.delete_lease(id) do
+      :ok ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{ok: true, id: id}))
+
+      {:error, :invalid_lease} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(400, Jason.encode!(%{error: "Invalid lease"}))
+
+      {:error, :lease_not_found} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(404, Jason.encode!(%{error: "Lease not found", id: id}))
+
+      {:error, reason} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)})
+        )
+    end
+  end
+
+  # POST /locks/:name/acquire - acquire a named lock using an active lease
+  post "/locks/:name/acquire" do
+    lease_id = conn.body_params["lease_id"]
+    holder = conn.body_params["holder"]
+
+    case Toska.KVStore.acquire_lock(name, lease_id, holder) do
+      {:ok, lock} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{ok: true, lock: lock}))
+
+      {:error, :invalid_lock} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(400, Jason.encode!(%{error: "Invalid lock request"}))
+
+      {:error, :lease_not_found} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(404, Jason.encode!(%{error: "Lease not found", lease_id: lease_id}))
+
+      {:error, :lock_held} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(409, Jason.encode!(%{error: "Lock held", name: name}))
+
+      {:error, reason} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)})
+        )
+    end
+  end
+
+  # POST /locks/:name/release - release a lock owned by lease_id
+  post "/locks/:name/release" do
+    lease_id = conn.body_params["lease_id"]
+
+    case Toska.KVStore.release_lock(name, lease_id) do
+      :ok ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{ok: true, name: name}))
+
+      {:error, :invalid_lock} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(400, Jason.encode!(%{error: "Invalid lock request"}))
+
+      {:error, :lock_not_found} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(404, Jason.encode!(%{error: "Lock not found", name: name}))
+
+      {:error, :lock_owner_mismatch} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(409, Jason.encode!(%{error: "Lock owner mismatch", name: name}))
+
+      {:error, reason} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "KV store unavailable", reason: inspect(reason)})
+        )
+    end
+  end
+
   # GET /kv/:key - fetch value
   get "/kv/:key" do
     case Toska.KVStore.get_entry(key) do
@@ -448,7 +607,7 @@ defmodule Toska.Router do
   put "/kv/:key" do
     value = conn.body_params["value"]
     ttl_ms = conn.body_params["ttl_ms"]
-    conditions = write_conditions(conn)
+    options = write_options(conn)
 
     cond do
       not is_binary(value) ->
@@ -457,7 +616,7 @@ defmodule Toska.Router do
         |> send_resp(400, Jason.encode!(%{error: "Value must be a string"}))
 
       true ->
-        case Toska.KVStore.put(key, value, ttl_ms, conditions) do
+        case Toska.KVStore.put(key, value, ttl_ms, options) do
           :ok ->
             case Toska.KVStore.get_entry(key) do
               {:ok, entry} ->
@@ -481,6 +640,16 @@ defmodule Toska.Router do
             conn
             |> put_resp_content_type("application/json")
             |> send_resp(400, Jason.encode!(%{error: "Invalid conditions"}))
+
+          {:error, :invalid_lease} ->
+            conn
+            |> put_resp_content_type("application/json")
+            |> send_resp(400, Jason.encode!(%{error: "Invalid lease"}))
+
+          {:error, :lease_not_found} ->
+            conn
+            |> put_resp_content_type("application/json")
+            |> send_resp(404, Jason.encode!(%{error: "Lease not found"}))
 
           {:error, reason} ->
             conn
@@ -823,6 +992,8 @@ defmodule Toska.Router do
 
   defp kv_path?(path) do
     String.starts_with?(path, "/kv") or
+      String.starts_with?(path, "/leases") or
+      String.starts_with?(path, "/locks") or
       path == "/stats" or
       String.starts_with?(path, "/replication")
   end
@@ -832,7 +1003,9 @@ defmodule Toska.Router do
     path = conn.request_path
 
     (method in ["PUT", "DELETE"] and String.starts_with?(path, "/kv/")) or
-      (method == "POST" and path == "/kv/txn")
+      (method == "POST" and path == "/kv/txn") or
+      (method in ["POST", "DELETE"] and String.starts_with?(path, "/leases")) or
+      (method == "POST" and String.starts_with?(path, "/locks"))
   end
 
   defp follower_mode? do
@@ -872,7 +1045,8 @@ defmodule Toska.Router do
       version: entry.version,
       created_at: entry.created_at,
       updated_at: entry.updated_at,
-      expires_at: entry.expires_at
+      expires_at: entry.expires_at,
+      lease_id: Map.get(entry, :lease_id)
     }
   end
 
@@ -902,6 +1076,18 @@ defmodule Toska.Router do
           conn.params["if_present"]
         ])
     }
+  end
+
+  defp write_options(conn) do
+    conn
+    |> write_conditions()
+    |> Map.put(
+      :lease_id,
+      first_present([
+        conn.body_params["lease_id"],
+        conn.params["lease_id"]
+      ])
+    )
   end
 
   defp first_present(values) do

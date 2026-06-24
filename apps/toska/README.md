@@ -172,6 +172,11 @@ When the server is running, the HTTP API provides a simple JSON key/value store:
 - `POST /kv/mget` - Fetch multiple keys (`{"keys": ["a", "b"]}`)
 - `POST /kv/txn` - Atomically compare keys and apply a success or failure operation list
 - `GET /kv/watch?prefix=&since_revision=0` - Server-Sent Events stream for key changes
+- `POST /leases` - Create a lease (`{"ttl_ms": 30000, "id": "optional-id"}`)
+- `POST /leases/:id/keepalive` - Renew a lease to `now + ttl_ms`
+- `DELETE /leases/:id` - Revoke a lease and remove attached keys/locks
+- `POST /locks/:name/acquire` - Acquire a named lock with an active `lease_id`
+- `POST /locks/:name/release` - Release a named lock with its owning `lease_id`
 - `GET /stats` - Store metrics and persistence info
 - `GET /replication/info` - Snapshot + AOF metadata for followers
 - `GET /replication/snapshot` - JSON snapshot file
@@ -179,13 +184,13 @@ When the server is running, the HTTP API provides a simple JSON key/value store:
 - `GET /replication/status` - Follower status
 
 Follower mode is enabled by setting `replica_url` (or `TOSKA_REPLICA_URL`) and starting the server.
-When follower mode is enabled, KV write endpoints (`PUT`/`DELETE`) return `403` to enforce read-only access.
+When follower mode is enabled, KV, lease, and lock write endpoints return `403` to enforce read-only access.
 
-KV endpoints (`/kv/*` and `/stats`) can require an auth token and apply rate limits:
+KV, lease, lock, stats, and replication endpoints can require an auth token and apply rate limits:
 - `auth_token` (or `TOSKA_AUTH_TOKEN`) expects `Authorization: Bearer <token>` or `X-Toska-Token`.
 - `rate_limit_per_sec` + `rate_limit_burst` (or `TOSKA_RATE_LIMIT_PER_SEC`, `TOSKA_RATE_LIMIT_BURST`).
 
-`GET /kv/:key` returns `value` plus metadata (`version`, `created_at`, `updated_at`, `expires_at`) and sets an `ETag` matching the current version.
+`GET /kv/:key` returns `value` plus metadata (`version`, `created_at`, `updated_at`, `expires_at`, `lease_id`) and sets an `ETag` matching the current version.
 `PUT /kv/:key` accepts optional `if_version`, `if_absent`, and `if_present` fields. `DELETE /kv/:key` accepts `if_version` as a query parameter. `PUT` and `DELETE` also accept `If-Match: "<version>"`; failed conditions return `412`.
 
 `POST /kv/txn` accepts `compare`, `success`, and `failure` arrays. Compares support `version`, `exists`, and `value`; operations support `put`, `delete`, and `get`. The selected operation list runs atomically inside the KV store.
@@ -195,6 +200,20 @@ KV endpoints (`/kv/*` and `/stats`) can require an auth token and apply rate lim
 ```bash
 curl -N "http://localhost:4000/kv/watch?prefix=jobs:&since_revision=0"
 ```
+
+`POST /leases` creates a durable TTL ownership record. Writing a key with `lease_id` attaches the key to that lease; keepalive extends the lease and attached key expirations. Revoking or expiring the lease removes attached keys and releases attached locks.
+
+```bash
+curl -s -X POST http://localhost:4000/leases \
+  -H 'content-type: application/json' \
+  -d '{"id":"worker-1","ttl_ms":30000}'
+
+curl -s -X PUT http://localhost:4000/kv/jobs/active/worker-1 \
+  -H 'content-type: application/json' \
+  -d '{"value":"running","lease_id":"worker-1"}'
+```
+
+`POST /locks/:name/acquire` acquires a named lock with an active lease. A held lock returns `409`; release requires the owning `lease_id`.
 
 `GET /kv/keys` returns `{"keys": [...], "next_cursor": "..."}`. When `next_cursor` is present, pass it back as `cursor` with the same `prefix` to fetch the next page. `limit` defaults to `100`, may be `0`, and cannot exceed `1000`.
 
@@ -221,7 +240,7 @@ Set `TOSKA_DATA_DIR` to override the data directory for AOF/snapshot files.
 - **replica_url** (string): Leader URL for follower replication (default: empty)
 - **replica_poll_interval_ms** (integer): Follower poll interval (default: 1000)
 - **replica_http_timeout_ms** (integer): Follower HTTP timeout (default: 5000)
-- **auth_token** (string): Bearer token for KV endpoints (default: empty)
+- **auth_token** (string): Bearer token for protected API endpoints (default: empty)
 - **rate_limit_per_sec** (integer): Requests per second limit (default: 0, disabled)
 - **rate_limit_burst** (integer): Burst capacity for rate limiting (default: 0, disabled)
 

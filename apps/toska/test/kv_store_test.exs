@@ -182,6 +182,79 @@ defmodule Toska.KVStoreTest do
     assert :ok = Toska.KVStore.unwatch(watch.ref)
   end
 
+  test "leases attach keys and keepalive extends leased key expiration" do
+    assert {:ok, lease} = Toska.KVStore.create_lease(100, id: "lease-key")
+    assert :ok = Toska.KVStore.put("leased:key", "value", nil, lease_id: lease.id)
+
+    assert {:ok, entry} = Toska.KVStore.get_entry("leased:key")
+    assert entry.lease_id == lease.id
+    assert entry.expires_at == lease.expires_at
+    assert entry.version == 1
+
+    :timer.sleep(2)
+    assert {:ok, renewed} = Toska.KVStore.keepalive_lease(lease.id)
+    assert renewed.expires_at > lease.expires_at
+
+    assert {:ok, renewed_entry} = Toska.KVStore.get_entry("leased:key")
+    assert renewed_entry.lease_id == lease.id
+    assert renewed_entry.expires_at == renewed.expires_at
+    assert renewed_entry.version == 2
+  end
+
+  test "deleting a lease removes attached keys and locks" do
+    assert {:ok, lease} = Toska.KVStore.create_lease(5_000, id: "lease-delete")
+    assert :ok = Toska.KVStore.put("leased:delete", "value", nil, lease_id: lease.id)
+    assert {:ok, lock} = Toska.KVStore.acquire_lock("cleanup-lock", lease.id, "worker-1")
+    assert lock.lease_id == lease.id
+
+    assert :ok = Toska.KVStore.delete_lease(lease.id)
+    assert {:error, :not_found} = Toska.KVStore.get("leased:delete")
+    assert {:error, :lock_not_found} = Toska.KVStore.release_lock("cleanup-lock", lease.id)
+  end
+
+  test "locks require an active lease and enforce ownership on release" do
+    assert {:ok, owner} = Toska.KVStore.create_lease(5_000, id: "lock-owner")
+    assert {:ok, contender} = Toska.KVStore.create_lease(5_000, id: "lock-contender")
+
+    assert {:ok, lock} = Toska.KVStore.acquire_lock("job:lock", owner.id, "owner")
+    assert lock.name == "job:lock"
+    assert lock.lease_id == owner.id
+    assert {:error, :lock_held} = Toska.KVStore.acquire_lock("job:lock", contender.id, nil)
+    assert {:error, :lock_owner_mismatch} = Toska.KVStore.release_lock("job:lock", contender.id)
+    assert :ok = Toska.KVStore.release_lock("job:lock", owner.id)
+    assert {:ok, next_lock} = Toska.KVStore.acquire_lock("job:lock", contender.id, nil)
+    assert next_lock.lease_id == contender.id
+  end
+
+  test "expired leases release keys and locks" do
+    assert {:ok, lease} = Toska.KVStore.create_lease(5, id: "lease-expire")
+    assert :ok = Toska.KVStore.put("leased:expire", "value", nil, lease_id: lease.id)
+    assert {:ok, _lock} = Toska.KVStore.acquire_lock("expire-lock", lease.id, nil)
+
+    :timer.sleep(20)
+    assert {:error, :not_found} = Toska.KVStore.get("leased:expire")
+
+    assert {:ok, next_lease} = Toska.KVStore.create_lease(5_000, id: "lease-expire-next")
+    assert {:ok, lock} = Toska.KVStore.acquire_lock("expire-lock", next_lease.id, nil)
+    assert lock.lease_id == next_lease.id
+  end
+
+  test "aof replay restores active leases locks and leased keys" do
+    assert {:ok, lease} = Toska.KVStore.create_lease(5_000, id: "lease-persist")
+    assert :ok = Toska.KVStore.put("leased:persist", "value", nil, lease_id: lease.id)
+    assert {:ok, _lock} = Toska.KVStore.acquire_lock("persist-lock", lease.id, nil)
+
+    stop_store()
+    start_store()
+
+    assert {:ok, entry} = Toska.KVStore.get_entry("leased:persist")
+    assert entry.value == "value"
+    assert entry.lease_id == lease.id
+
+    assert {:ok, contender} = Toska.KVStore.create_lease(5_000, id: "lease-persist-contender")
+    assert {:error, :lock_held} = Toska.KVStore.acquire_lock("persist-lock", contender.id, nil)
+  end
+
   test "ttl expires keys" do
     assert :ok = Toska.KVStore.put("temp", "value", 10)
     :timer.sleep(20)

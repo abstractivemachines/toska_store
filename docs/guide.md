@@ -195,6 +195,11 @@ When the server is running, the HTTP API provides a simple JSON key/value store:
 - `POST /kv/mget` - Fetch multiple keys (`{"keys": ["a", "b"]}`)
 - `POST /kv/txn` - Atomically compare keys and apply a success or failure operation list
 - `GET /kv/watch?prefix=&since_revision=0` - Server-Sent Events change feed
+- `POST /leases` - Create a lease (`{"ttl_ms": 30000, "id": "optional-id"}`)
+- `POST /leases/:id/keepalive` - Renew a lease to `now + ttl_ms`
+- `DELETE /leases/:id` - Revoke a lease and remove attached keys/locks
+- `POST /locks/:name/acquire` - Acquire a named lock with an active `lease_id`
+- `POST /locks/:name/release` - Release a named lock with its owning `lease_id`
 - `GET /stats` - Store metrics and persistence info
 - `GET /replication/info` - Snapshot + AOF metadata for followers
 - `GET /replication/snapshot` - JSON snapshot file
@@ -202,9 +207,9 @@ When the server is running, the HTTP API provides a simple JSON key/value store:
 - `GET /replication/status` - Follower status
 
 Follower mode is enabled by setting `replica_url` (or `TOSKA_REPLICA_URL`) and starting the server.
-When follower mode is enabled, KV write endpoints (`PUT`/`DELETE`) return `403` to enforce read-only access.
+When follower mode is enabled, KV, lease, and lock write endpoints return `403` to enforce read-only access.
 
-KV endpoints (`/kv/*` and `/stats`) can require an auth token and apply rate limits:
+KV, lease, lock, stats, and replication endpoints can require an auth token and apply rate limits:
 - `auth_token` (or `TOSKA_AUTH_TOKEN`) expects `Authorization: Bearer <token>` or `X-Toska-Token`.
 - `rate_limit_per_sec` + `rate_limit_burst` (or `TOSKA_RATE_LIMIT_PER_SEC`, `TOSKA_RATE_LIMIT_BURST`).
 
@@ -220,7 +225,8 @@ KV endpoints (`/kv/*` and `/stats`) can require an auth token and apply rate lim
     "version": 1,
     "created_at": 1782269800000,
     "updated_at": 1782269800000,
-    "expires_at": null
+    "expires_at": null,
+    "lease_id": null
   }
 }
 ```
@@ -264,7 +270,8 @@ Response:
         "version": 2,
         "created_at": 1782269800000,
         "updated_at": 1782269810000,
-        "expires_at": null
+        "expires_at": null,
+        "lease_id": null
       }
     }
   ]
@@ -286,7 +293,7 @@ Example event:
 ```text
 id: 42
 event: put
-data: {"op":"put","key":"todo:1","value":"ship","revision":42,"timestamp":1782269820000,"metadata":{"version":3,"created_at":1782269800000,"updated_at":1782269820000,"expires_at":null}}
+data: {"op":"put","key":"todo:1","value":"ship","revision":42,"timestamp":1782269820000,"metadata":{"version":3,"created_at":1782269800000,"updated_at":1782269820000,"expires_at":null,"lease_id":null}}
 ```
 
 Query parameters:
@@ -297,6 +304,36 @@ Query parameters:
 - `timeout_ms=1000` closes an idle live stream after the timeout, mainly for bounded clients and tests.
 
 The stream emits `put`, `delete`, and `expire` events. Replay is available from the current AOF/revision window and in-memory watch history; requests older than retained history return `409`.
+
+### Leases and Locks
+
+Leases are durable TTL ownership records. A key written with `lease_id` uses the lease expiration instead of its own `ttl_ms`; renewing the lease extends every attached key and any lock held by that lease. Revoking or expiring a lease removes attached keys and releases attached locks.
+
+```bash
+curl -s -X POST http://localhost:4000/leases \
+  -H 'content-type: application/json' \
+  -d '{"id":"worker-1","ttl_ms":30000}'
+
+curl -s -X PUT http://localhost:4000/kv/jobs/active/worker-1 \
+  -H 'content-type: application/json' \
+  -d '{"value":"running","lease_id":"worker-1"}'
+
+curl -s -X POST http://localhost:4000/leases/worker-1/keepalive
+```
+
+Create a lease-backed lock by acquiring a name with an active lease:
+
+```bash
+curl -s -X POST http://localhost:4000/locks/nightly/acquire \
+  -H 'content-type: application/json' \
+  -d '{"lease_id":"worker-1","holder":"worker-a"}'
+
+curl -s -X POST http://localhost:4000/locks/nightly/release \
+  -H 'content-type: application/json' \
+  -d '{"lease_id":"worker-1"}'
+```
+
+Lock acquisition returns `409` when another active lease owns the lock. Releasing a lock with the wrong lease returns `409`; missing leases or locks return `404`.
 
 ### Key Listing
 
@@ -393,7 +430,7 @@ Set `TOSKA_CONFIG_DIR` to override the configuration directory used for `toska_c
 - **replica_url** - Leader URL for follower replication (default: empty)
 - **replica_poll_interval_ms** - Follower poll interval (default: 1000)
 - **replica_http_timeout_ms** - Follower HTTP timeout (default: 5000)
-- **auth_token** - Bearer token for KV endpoints (default: empty)
+- **auth_token** - Bearer token for protected API endpoints (default: empty)
 - **rate_limit_per_sec** - Requests per second limit (default: 0, disabled)
 - **rate_limit_burst** - Burst capacity for rate limiting (default: 0, disabled)
 
@@ -440,7 +477,7 @@ The application respects the following environment variables:
 - `TOSKA_REPLICA_URL` - Leader URL for replication follower
 - `TOSKA_REPLICA_POLL_MS` - Override follower poll interval
 - `TOSKA_REPLICA_HTTP_TIMEOUT_MS` - Override follower HTTP timeout
-- `TOSKA_AUTH_TOKEN` - Require auth token for KV endpoints
+- `TOSKA_AUTH_TOKEN` - Require auth token for protected API endpoints
 - `TOSKA_RATE_LIMIT_PER_SEC` - Requests per second limit
 - `TOSKA_RATE_LIMIT_BURST` - Burst capacity for rate limiting
 
