@@ -978,20 +978,22 @@ defmodule Toska.Router do
   end
 
   defp ensure_kv_access(conn, _opts) do
-    if kv_path?(conn.request_path) do
-      conn
-      |> ensure_auth()
-      |> ensure_rate_limit()
-      |> ensure_read_only()
-    else
-      conn
+    case auth_scope(conn) do
+      nil ->
+        conn
+
+      scope ->
+        conn
+        |> ensure_auth(scope)
+        |> ensure_rate_limit()
+        |> ensure_read_only()
     end
   end
 
-  defp ensure_auth(%Plug.Conn{halted: true} = conn), do: conn
+  defp ensure_auth(%Plug.Conn{halted: true} = conn, _scope), do: conn
 
-  defp ensure_auth(conn) do
-    token = auth_token(conn.request_path)
+  defp ensure_auth(conn, scope) do
+    token = auth_token(scope)
 
     if token == "" do
       conn
@@ -1038,35 +1040,49 @@ defmodule Toska.Router do
     end
   end
 
-  defp kv_path?(path) do
-    String.starts_with?(path, "/kv") or
-      String.starts_with?(path, "/leases") or
-      String.starts_with?(path, "/locks") or
-      path == "/stats" or
-      String.starts_with?(path, "/replication")
-  end
-
-  defp write_request?(conn) do
-    method = conn.method
+  defp auth_scope(conn) do
     path = conn.request_path
 
-    (method in ["PUT", "DELETE"] and String.starts_with?(path, "/kv/")) or
-      (method == "POST" and path == "/kv/txn") or
-      (method in ["POST", "DELETE"] and String.starts_with?(path, "/leases")) or
-      (method == "POST" and String.starts_with?(path, "/locks"))
+    cond do
+      String.starts_with?(path, "/replication") ->
+        :replication
+
+      path == "/admin/reload" ->
+        :admin
+
+      path in ["/stats", "/metrics"] ->
+        :read
+
+      String.starts_with?(path, "/leases") or String.starts_with?(path, "/locks") ->
+        :write
+
+      String.starts_with?(path, "/kv") ->
+        kv_auth_scope(conn)
+
+      true ->
+        nil
+    end
+  end
+
+  defp kv_auth_scope(%Plug.Conn{method: "POST", request_path: "/kv/mget"}), do: :read
+
+  defp kv_auth_scope(%Plug.Conn{method: method}) when method in ["PUT", "POST", "DELETE"],
+    do: :write
+
+  defp kv_auth_scope(_conn), do: :read
+
+  defp write_request?(conn) do
+    auth_scope(conn) == :write
   end
 
   defp follower_mode? do
     ConfigManager.cached_follower_mode?()
   end
 
-  defp auth_token(path) do
-    if String.starts_with?(path, "/replication") do
-      ConfigManager.cached_replication_auth_token()
-    else
-      ConfigManager.cached_auth_token()
-    end
-  end
+  defp auth_token(:read), do: ConfigManager.cached_read_auth_token()
+  defp auth_token(:write), do: ConfigManager.cached_write_auth_token()
+  defp auth_token(:admin), do: ConfigManager.cached_admin_auth_token()
+  defp auth_token(:replication), do: ConfigManager.cached_replication_auth_token()
 
   defp token_match?(_token, nil), do: false
 

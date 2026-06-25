@@ -148,6 +148,17 @@ ToskaStore's main adoption advantage is HTTP/JSON ergonomics, so client friction
 
 ### 7. Production Security
 
+Status: In progress.
+
+Implementation checkpoints:
+
+- [x] Add separate read, write, admin, and replication auth token configuration.
+- [x] Enforce scoped tokens across protected HTTP endpoints.
+- [x] Preserve `auth_token` as the legacy fallback when scoped tokens are unset.
+- [ ] Add named tokens for auditability.
+- [ ] Add optional mTLS for replication and admin endpoints.
+- [ ] Add audit logging for writes and admin changes.
+
 Move beyond one shared token:
 
 - separate read, write, admin, and replication tokens
@@ -206,6 +217,6 @@ For larger-than-memory datasets, evaluate an LSM-style or embedded durable backe
 
 ## Recommended Next PR
 
-Implement production security improvements.
+Continue production security hardening.
 
-The HTTP API now has a maintained OpenAPI contract and a client SDK plan. The next highest-leverage step is replacing the single shared token model with production-grade read, write, admin, and replication credentials.
+Scoped read, write, admin, and replication credentials are underway. The next highest-leverage step is adding named tokens and audit logging so production operators can attribute writes and admin changes.

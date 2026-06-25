@@ -5,7 +5,7 @@ defmodule Toska.ConfigManager do
   Handles reading, writing, and managing configuration for the Toska CLI and server.
   Configuration is stored in a simple key-value format and persisted to disk.
 
-  Hot-path configuration values (auth_token, replication_auth_token, rate limits, replica_url) are cached
+  Hot-path configuration values (auth tokens, rate limits, replica_url) are cached
   in persistent_term for lock-free reads on every HTTP request.
   """
 
@@ -18,6 +18,9 @@ defmodule Toska.ConfigManager do
   # Keys cached in persistent_term for hot-path access (avoid GenServer calls per request)
   @cached_keys [
     "auth_token",
+    "read_auth_token",
+    "write_auth_token",
+    "admin_auth_token",
     "replication_auth_token",
     "rate_limit_per_sec",
     "rate_limit_burst",
@@ -126,22 +129,35 @@ defmodule Toska.ConfigManager do
   end
 
   @doc """
+  Get the cached read auth token. Falls back to auth_token when unset.
+  Environment variable TOSKA_READ_AUTH_TOKEN takes precedence.
+  """
+  def cached_read_auth_token do
+    cached_scoped_auth_token("TOSKA_READ_AUTH_TOKEN", :read_auth_token)
+  end
+
+  @doc """
+  Get the cached write auth token. Falls back to auth_token when unset.
+  Environment variable TOSKA_WRITE_AUTH_TOKEN takes precedence.
+  """
+  def cached_write_auth_token do
+    cached_scoped_auth_token("TOSKA_WRITE_AUTH_TOKEN", :write_auth_token)
+  end
+
+  @doc """
+  Get the cached admin auth token. Falls back to auth_token when unset.
+  Environment variable TOSKA_ADMIN_AUTH_TOKEN takes precedence.
+  """
+  def cached_admin_auth_token do
+    cached_scoped_auth_token("TOSKA_ADMIN_AUTH_TOKEN", :admin_auth_token)
+  end
+
+  @doc """
   Get the cached replication auth token. Falls back to auth_token when unset.
   Environment variable TOSKA_REPLICATION_AUTH_TOKEN takes precedence.
   """
   def cached_replication_auth_token do
-    token =
-      case System.get_env("TOSKA_REPLICATION_AUTH_TOKEN") do
-        nil -> :persistent_term.get({__MODULE__, :replication_auth_token}, "")
-        "" -> :persistent_term.get({__MODULE__, :replication_auth_token}, "")
-        value -> value
-      end
-
-    if token == "" do
-      cached_auth_token()
-    else
-      token
-    end
+    cached_scoped_auth_token("TOSKA_REPLICATION_AUTH_TOKEN", :replication_auth_token)
   end
 
   @doc """
@@ -250,6 +266,21 @@ defmodule Toska.ConfigManager do
 
   defp parse_int_or_default(val, _default) when is_integer(val), do: val
   defp parse_int_or_default(_, default), do: default
+
+  defp cached_scoped_auth_token(env_key, cache_key) do
+    token =
+      case System.get_env(env_key) do
+        nil -> :persistent_term.get({__MODULE__, cache_key}, "")
+        "" -> :persistent_term.get({__MODULE__, cache_key}, "")
+        value -> value
+      end
+
+    if token == "" do
+      cached_auth_token()
+    else
+      token
+    end
+  end
 
   # GenServer Callbacks
 
@@ -366,6 +397,9 @@ defmodule Toska.ConfigManager do
   defp update_cache(config) do
     # Cache hot-path values in persistent_term for lock-free reads
     :persistent_term.put({__MODULE__, :auth_token}, config["auth_token"] || "")
+    :persistent_term.put({__MODULE__, :read_auth_token}, config["read_auth_token"] || "")
+    :persistent_term.put({__MODULE__, :write_auth_token}, config["write_auth_token"] || "")
+    :persistent_term.put({__MODULE__, :admin_auth_token}, config["admin_auth_token"] || "")
 
     :persistent_term.put(
       {__MODULE__, :replication_auth_token},
@@ -495,6 +529,15 @@ defmodule Toska.ConfigManager do
       "auth_token" ->
         validate_optional_string(value)
 
+      "read_auth_token" ->
+        validate_optional_string(value)
+
+      "write_auth_token" ->
+        validate_optional_string(value)
+
+      "admin_auth_token" ->
+        validate_optional_string(value)
+
       "replication_auth_token" ->
         validate_optional_string(value)
 
@@ -614,6 +657,9 @@ defmodule Toska.ConfigManager do
       "replica_poll_interval_ms" => 1000,
       "replica_http_timeout_ms" => 5000,
       "auth_token" => "",
+      "read_auth_token" => "",
+      "write_auth_token" => "",
+      "admin_auth_token" => "",
       "replication_auth_token" => "",
       "rate_limit_per_sec" => 0,
       "rate_limit_burst" => 0,
