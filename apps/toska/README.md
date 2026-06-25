@@ -184,11 +184,15 @@ When the server is running, the HTTP API provides a simple JSON key/value store:
 - `GET /replication/aof?since=0&max_bytes=65536` - AOF stream from a byte offset
 - `GET /replication/status` - Follower status
 
+The maintained HTTP API contract lives at `../../openapi.yaml`, and the initial generated client plan is documented in `../../docs/client-sdks.md`.
+
 Follower mode is enabled by setting `replica_url` (or `TOSKA_REPLICA_URL`) and starting the server.
 When follower mode is enabled, KV, lease, and lock write endpoints return `403` to enforce read-only access.
 
-KV, lease, lock, stats, and replication endpoints can require an auth token and apply rate limits:
-- `auth_token` (or `TOSKA_AUTH_TOKEN`) expects `Authorization: Bearer <token>` or `X-Toska-Token`.
+KV, lease, lock, stats, and replication endpoints can require auth tokens and apply rate limits:
+- `auth_token` (or `TOSKA_AUTH_TOKEN`) protects KV, lease, lock, and stats endpoints.
+- `replication_auth_token` (or `TOSKA_REPLICATION_AUTH_TOKEN`) protects replication endpoints and falls back to `auth_token` when unset.
+- Protected endpoints expect `Authorization: Bearer <token>` or `X-Toska-Token`.
 - `rate_limit_per_sec` + `rate_limit_burst` (or `TOSKA_RATE_LIMIT_PER_SEC`, `TOSKA_RATE_LIMIT_BURST`).
 
 `GET /kv/:key` returns `value` plus metadata (`version`, `created_at`, `updated_at`, `expires_at`, `lease_id`) and sets an `ETag` matching the current version.
@@ -244,6 +248,7 @@ Set `TOSKA_DATA_DIR` to override the data directory for AOF/snapshot files.
 - **replica_poll_interval_ms** (integer): Follower poll interval (default: 1000)
 - **replica_http_timeout_ms** (integer): Follower HTTP timeout (default: 5000)
 - **auth_token** (string): Bearer token for protected API endpoints (default: empty)
+- **replication_auth_token** (string): Bearer token for replication endpoints, falling back to `auth_token` when empty (default: empty)
 - **rate_limit_per_sec** (integer): Requests per second limit (default: 0, disabled)
 - **rate_limit_burst** (integer): Burst capacity for rate limiting (default: 0, disabled)
 

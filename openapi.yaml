@@ -1,0 +1,1609 @@
+openapi: 3.1.0
+info:
+  title: ToskaStore HTTP API
+  version: 0.9.1
+  description: |
+    ToskaStore is a durable HTTP-native string key/value store. This
+    contract documents the current JSON, Server-Sent Events, and replication
+    endpoints exposed by the Toska Plug router.
+servers:
+  - url: http://localhost:4000
+    description: Local ToskaStore server
+tags:
+  - name: Status
+  - name: KV
+  - name: Watch
+  - name: Coordination
+  - name: Replication
+  - name: Admin
+paths:
+  /:
+    get:
+      tags:
+        - Status
+      operationId: getWelcomePage
+      summary: Render the HTML welcome page.
+      responses:
+        '200':
+          description: HTML status and endpoint page.
+          content:
+            text/html:
+              schema:
+                type: string
+  /status:
+    get:
+      tags:
+        - Status
+      operationId: getStatus
+      summary: Get server status.
+      responses:
+        '200':
+          description: Current server status and runtime configuration.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+  /health:
+    get:
+      tags:
+        - Status
+      operationId: getHealth
+      summary: Get health status.
+      responses:
+        '200':
+          description: Server is healthy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Server is starting or unhealthy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /stats:
+    get:
+      tags:
+        - Status
+      operationId: getStats
+      summary: Get KV store statistics.
+      description: Requires the configured Toska API token when auth is enabled.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      responses:
+        '200':
+          description: Store metrics and persistence metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Stats'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+  /metrics:
+    get:
+      tags:
+        - Status
+      operationId: getMetrics
+      summary: Get Prometheus text metrics.
+      responses:
+        '200':
+          description: Prometheus text exposition format.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '503':
+          description: Metrics are unavailable.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /admin/reload:
+    post:
+      tags:
+        - Admin
+      operationId: reloadConfiguration
+      summary: Reload server configuration from disk and environment.
+      responses:
+        '200':
+          description: Configuration was reloaded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkMessage'
+        '500':
+          description: Reload failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /kv:
+    get:
+      tags:
+        - KV
+      operationId: listRange
+      summary: List keys from the ordered range index.
+      description: |
+        Returns a lexicographic page of keys. Values and metadata are omitted
+        unless requested. Requires the configured Toska API token when auth is
+        enabled.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/PrefixQuery'
+        - name: start
+          in: query
+          description: Inclusive lower-bound key for the first page.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/LimitQuery'
+        - $ref: '#/components/parameters/CursorQuery'
+        - name: include_values
+          in: query
+          description: Include values on each returned range item.
+          schema:
+            type: boolean
+        - name: include_metadata
+          in: query
+          description: Include entry metadata on each returned range item.
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Range page.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RangeResponse'
+              examples:
+                range:
+                  $ref: '#/components/examples/RangeExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+  /kv/keys:
+    get:
+      tags:
+        - KV
+      operationId: listKeys
+      summary: List keys in lexicographic order.
+      description: Requires the configured Toska API token when auth is enabled.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/PrefixQuery'
+        - $ref: '#/components/parameters/LimitQuery'
+        - $ref: '#/components/parameters/CursorQuery'
+      responses:
+        '200':
+          description: Key page.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+  /kv/watch:
+    get:
+      tags:
+        - Watch
+      operationId: watchKeys
+      summary: Stream key changes as Server-Sent Events.
+      description: |
+        Streams `put`, `delete`, and `expire` events. Use `since_revision` to
+        replay retained history, `once=true` to close after replay, and
+        `timeout_ms` to bound idle live streams. Requires the configured Toska
+        API token when auth is enabled.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/PrefixQuery'
+        - name: since_revision
+          in: query
+          description: Replay events after this revision. Omit for live-only streaming.
+          schema:
+            type: integer
+            minimum: 0
+        - name: once
+          in: query
+          description: Close the stream after replayed events are sent.
+          schema:
+            type: boolean
+        - name: timeout_ms
+          in: query
+          description: Close an idle live stream after this many milliseconds.
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: SSE stream containing WatchEvent JSON in each data frame.
+          headers:
+            x-toska-revision:
+              description: Current store revision when the watch is opened.
+              schema:
+                type: integer
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              examples:
+                watch:
+                  $ref: '#/components/examples/WatchStreamExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Requested watch history is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+  /kv/txn:
+    post:
+      tags:
+        - KV
+      operationId: executeTransaction
+      summary: Atomically compare keys and apply success or failure operations.
+      description: |
+        Compares support `version`, `exists`, and `value`. Operations support
+        `put`, `delete`, and `get`. Requires the configured Toska API token when
+        auth is enabled. Followers reject this write with `403`.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransactionRequest'
+            examples:
+              transaction:
+                $ref: '#/components/examples/TransactionRequestExample'
+      responses:
+        '200':
+          description: Transaction result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionResponse'
+              examples:
+                transaction:
+                  $ref: '#/components/examples/TransactionResponseExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnlyFollower'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+  /kv/{key}:
+    get:
+      tags:
+        - KV
+      operationId: getKey
+      summary: Fetch one key.
+      description: Requires the configured Toska API token when auth is enabled.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/KeyPath'
+      responses:
+        '200':
+          description: Key entry.
+          headers:
+            ETag:
+              description: Quoted key version for conditional writes.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Entry'
+              examples:
+                entry:
+                  $ref: '#/components/examples/KeyValueExample'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+    put:
+      tags:
+        - KV
+      operationId: putKey
+      summary: Set one key.
+      description: |
+        Writes a string value, optionally with TTL, lease ownership, and
+        conditional fields. `If-Match` supplies the same version check as
+        `if_version`. `If-None-Match: *` creates only when absent. Followers
+        reject this write with `403`.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/KeyPath'
+        - $ref: '#/components/parameters/IfMatchHeader'
+        - $ref: '#/components/parameters/IfNoneMatchHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutEntryRequest'
+            examples:
+              put:
+                $ref: '#/components/examples/PutEntryRequestExample'
+      responses:
+        '200':
+          description: Updated entry or delete acknowledgement for non-positive TTL.
+          headers:
+            ETag:
+              description: Quoted key version when an entry remains.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PutEntryResponse'
+              examples:
+                put:
+                  $ref: '#/components/examples/PutEntryResponseExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnlyFollower'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/ConditionFailed'
+        '413':
+          $ref: '#/components/responses/RequestBodyTooLarge'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+    delete:
+      tags:
+        - KV
+      operationId: deleteKey
+      summary: Delete one key.
+      description: Followers reject this write with `403`.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/KeyPath'
+        - name: if_version
+          in: query
+          description: Delete only if the current version matches.
+          schema:
+            type: integer
+            minimum: 1
+        - $ref: '#/components/parameters/IfMatchHeader'
+      responses:
+        '200':
+          description: Key was deleted or was already absent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnlyFollower'
+        '412':
+          $ref: '#/components/responses/ConditionFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+  /kv/mget:
+    post:
+      tags:
+        - KV
+      operationId: getMultipleKeys
+      summary: Fetch multiple keys.
+      description: Requires the configured Toska API token when auth is enabled.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MGetRequest'
+      responses:
+        '200':
+          description: Map of requested keys to string values or null.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MGetResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+  /leases:
+    post:
+      tags:
+        - Coordination
+      operationId: createLease
+      summary: Create a lease.
+      description: |
+        Creates a durable TTL ownership record. Followers reject this write
+        with `403`.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateLeaseRequest'
+            examples:
+              lease:
+                $ref: '#/components/examples/CreateLeaseRequestExample'
+      responses:
+        '201':
+          description: Lease created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeaseResponse'
+              examples:
+                lease:
+                  $ref: '#/components/examples/LeaseExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnlyFollower'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+  /leases/{id}/keepalive:
+    post:
+      tags:
+        - Coordination
+      operationId: keepaliveLease
+      summary: Renew a lease.
+      description: Followers reject this write with `403`.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/LeaseIdPath'
+      responses:
+        '200':
+          description: Lease renewed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeaseResponse'
+              examples:
+                lease:
+                  $ref: '#/components/examples/LeaseExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnlyFollower'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+  /leases/{id}:
+    delete:
+      tags:
+        - Coordination
+      operationId: revokeLease
+      summary: Revoke a lease.
+      description: |
+        Removes attached keys and releases attached locks. Followers reject
+        this write with `403`.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/LeaseIdPath'
+      responses:
+        '200':
+          description: Lease revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeaseDeleteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnlyFollower'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+  /locks/{name}/acquire:
+    post:
+      tags:
+        - Coordination
+      operationId: acquireLock
+      summary: Acquire a named lock with an active lease.
+      description: Followers reject this write with `403`.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/LockNamePath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AcquireLockRequest'
+            examples:
+              lock:
+                $ref: '#/components/examples/AcquireLockRequestExample'
+      responses:
+        '200':
+          description: Lock acquired.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LockResponse'
+              examples:
+                lock:
+                  $ref: '#/components/examples/LockExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnlyFollower'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+  /locks/{name}/release:
+    post:
+      tags:
+        - Coordination
+      operationId: releaseLock
+      summary: Release a named lock.
+      description: Followers reject this write with `403`.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/LockNamePath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseLockRequest'
+      responses:
+        '200':
+          description: Lock released.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LockDeleteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ReadOnlyFollower'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+  /replication/info:
+    get:
+      tags:
+        - Replication
+      operationId: getReplicationInfo
+      summary: Get snapshot and append-only log metadata for followers.
+      description: Requires the configured replication token when replication auth is enabled.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      responses:
+        '200':
+          description: Replication metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplicationInfo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+  /replication/status:
+    get:
+      tags:
+        - Replication
+      operationId: getReplicationStatus
+      summary: Get follower status.
+      description: Requires the configured replication token when replication auth is enabled.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      responses:
+        '200':
+          description: Follower status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplicationStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Follower is not running.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+  /replication/snapshot:
+    get:
+      tags:
+        - Replication
+      operationId: getReplicationSnapshot
+      summary: Download the current JSON snapshot.
+      description: Requires the configured replication token when replication auth is enabled.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      responses:
+        '200':
+          description: Snapshot JSON file.
+          headers:
+            x-toska-snapshot-checksum:
+              description: Snapshot checksum when available.
+              schema:
+                type: string
+            x-toska-snapshot-version:
+              description: Snapshot format version when available.
+              schema:
+                type: integer
+            x-toska-aof-version:
+              description: AOF format version when available.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+  /replication/aof:
+    get:
+      tags:
+        - Replication
+      operationId: getReplicationAof
+      summary: Stream append-only log bytes from an offset.
+      description: Requires the configured replication token when replication auth is enabled.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
+      parameters:
+        - name: since
+          in: query
+          description: Byte offset to stream from. Defaults to 0.
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: max_bytes
+          in: query
+          description: Maximum bytes to return. Defaults to 1048576.
+          schema:
+            type: integer
+            minimum: 1
+            default: 1048576
+      responses:
+        '200':
+          description: AOF bytes.
+          headers:
+            x-toska-aof-size:
+              description: Current AOF size.
+              schema:
+                type: integer
+            x-toska-aof-offset:
+              description: Offset used for this stream.
+              schema:
+                type: integer
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '204':
+          description: Offset is at or beyond the current AOF size.
+          headers:
+            x-toska-aof-size:
+              description: Current AOF size.
+              schema:
+                type: integer
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Accepted when `TOSKA_AUTH_TOKEN`, `auth_token`, or the replication token
+        is configured. Send as `Authorization: Bearer <token>`.
+    toskaToken:
+      type: apiKey
+      in: header
+      name: X-Toska-Token
+      description: Alternate token header accepted by protected endpoints.
+  parameters:
+    KeyPath:
+      name: key
+      in: path
+      required: true
+      description: URL-encoded key path segment.
+      schema:
+        type: string
+        minLength: 1
+    LeaseIdPath:
+      name: id
+      in: path
+      required: true
+      description: Lease identifier.
+      schema:
+        type: string
+        minLength: 1
+    LockNamePath:
+      name: name
+      in: path
+      required: true
+      description: Lock name.
+      schema:
+        type: string
+        minLength: 1
+    PrefixQuery:
+      name: prefix
+      in: query
+      description: Optional key prefix filter.
+      schema:
+        type: string
+        default: ''
+    LimitQuery:
+      name: limit
+      in: query
+      description: Page size. Defaults to 100 and cannot exceed 1000.
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 1000
+        default: 100
+    CursorQuery:
+      name: cursor
+      in: query
+      description: Cursor returned by the previous page.
+      schema:
+        type: string
+    IfMatchHeader:
+      name: If-Match
+      in: header
+      description: Quoted key version required for the write to proceed.
+      schema:
+        type: string
+        example: '"1"'
+    IfNoneMatchHeader:
+      name: If-None-Match
+      in: header
+      description: Use `*` to require that the key is absent.
+      schema:
+        type: string
+        example: '*'
+  responses:
+    BadRequest:
+      description: Invalid request parameters or JSON body.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing or invalid token when auth is enabled.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ReadOnlyFollower:
+      description: The server is running as a read-only follower.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Resource was not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: Resource conflict.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ConditionFailed:
+      description: Conditional write precondition failed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RequestBodyTooLarge:
+      description: Request body exceeds the configured maximum size.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RateLimited:
+      description: Request exceeded configured rate limits.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    StoreUnavailable:
+      description: KV store or replication subsystem is unavailable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+        reason:
+          type: string
+        key:
+          type: string
+        path:
+          type: string
+        id:
+          type: string
+        name:
+          type: string
+        lease_id:
+          type: string
+        max:
+          type: integer
+        max_bytes:
+          type: integer
+      additionalProperties: true
+    OkMessage:
+      type: object
+      required:
+        - ok
+        - message
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+    StatusResponse:
+      type: object
+      required:
+        - status
+        - uptime
+      properties:
+        status:
+          type: string
+          enum:
+            - running
+            - starting
+            - stopped
+            - error
+        uptime:
+          type:
+            - integer
+            - 'null'
+          minimum: 0
+        config:
+          type:
+            - object
+            - 'null'
+          additionalProperties: true
+      additionalProperties: true
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - timestamp
+        - uptime
+      properties:
+        status:
+          type: string
+          enum:
+            - healthy
+            - starting
+            - unhealthy
+        timestamp:
+          type: integer
+        uptime:
+          type:
+            - integer
+            - 'null'
+    Stats:
+      type: object
+      properties:
+        keys:
+          type: integer
+        memory_words:
+          type: integer
+        aof_path:
+          type: string
+        aof_bytes:
+          type: integer
+        snapshot_path:
+          type: string
+        snapshot_bytes:
+          type: integer
+        snapshot_checksum:
+          type:
+            - string
+            - 'null'
+        snapshot_version:
+          type: integer
+        aof_version:
+          type: integer
+        sync_mode:
+          type: string
+        sync_interval_ms:
+          type: integer
+        snapshot_interval_ms:
+          type: integer
+        ttl_check_interval_ms:
+          type: integer
+        compaction_interval_ms:
+          type: integer
+        compaction_aof_bytes:
+          type: integer
+        revision:
+          type: integer
+        leases:
+          type: integer
+        locks:
+          type: integer
+        watch_history_size:
+          type: integer
+        watch_history_limit:
+          type: integer
+        watchers:
+          type: integer
+        last_snapshot_at:
+          type:
+            - integer
+            - 'null'
+        last_sync_at:
+          type:
+            - integer
+            - 'null'
+      additionalProperties: true
+    EntryMetadata:
+      type: object
+      required:
+        - version
+        - created_at
+        - updated_at
+        - expires_at
+        - lease_id
+      properties:
+        version:
+          type: integer
+          minimum: 1
+        created_at:
+          type: integer
+        updated_at:
+          type: integer
+        expires_at:
+          type:
+            - integer
+            - 'null'
+        lease_id:
+          type:
+            - string
+            - 'null'
+    Entry:
+      type: object
+      required:
+        - key
+        - value
+        - metadata
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+        metadata:
+          $ref: '#/components/schemas/EntryMetadata'
+    PutEntryRequest:
+      type: object
+      required:
+        - value
+      properties:
+        value:
+          type: string
+        ttl_ms:
+          type:
+            - integer
+            - 'null'
+        if_version:
+          type: integer
+          minimum: 1
+        if_absent:
+          type: boolean
+        if_present:
+          type: boolean
+        lease_id:
+          type:
+            - string
+            - 'null'
+    PutEntryResponse:
+      oneOf:
+        - allOf:
+            - $ref: '#/components/schemas/Entry'
+            - type: object
+              required:
+                - ok
+              properties:
+                ok:
+                  type: boolean
+        - $ref: '#/components/schemas/DeleteResponse'
+    DeleteResponse:
+      type: object
+      required:
+        - ok
+        - key
+      properties:
+        ok:
+          type: boolean
+        key:
+          type: string
+    KeyListResponse:
+      type: object
+      required:
+        - keys
+        - next_cursor
+      properties:
+        keys:
+          type: array
+          items:
+            type: string
+        next_cursor:
+          type:
+            - string
+            - 'null'
+    RangeItem:
+      type: object
+      required:
+        - key
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+        metadata:
+          $ref: '#/components/schemas/EntryMetadata'
+    RangeResponse:
+      type: object
+      required:
+        - items
+        - next_cursor
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RangeItem'
+        next_cursor:
+          type:
+            - string
+            - 'null'
+    MGetRequest:
+      type: object
+      required:
+        - keys
+      properties:
+        keys:
+          type: array
+          items:
+            type: string
+    MGetResponse:
+      type: object
+      required:
+        - values
+      properties:
+        values:
+          type: object
+          additionalProperties:
+            type:
+              - string
+              - 'null'
+    TransactionCompare:
+      type: object
+      required:
+        - key
+      properties:
+        key:
+          type: string
+        version:
+          type: integer
+          minimum: 1
+        exists:
+          type: boolean
+        value:
+          type: string
+    TransactionOperation:
+      type: object
+      required:
+        - op
+        - key
+      properties:
+        op:
+          type: string
+          enum:
+            - put
+            - delete
+            - get
+        key:
+          type: string
+        value:
+          type: string
+        ttl_ms:
+          type:
+            - integer
+            - 'null'
+    TransactionRequest:
+      type: object
+      properties:
+        compare:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransactionCompare'
+          default: []
+        success:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransactionOperation'
+          default: []
+        failure:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransactionOperation'
+          default: []
+    TransactionOperationResponse:
+      type: object
+      required:
+        - op
+        - key
+      properties:
+        op:
+          type: string
+          enum:
+            - put
+            - delete
+            - get
+        key:
+          type: string
+        value:
+          type:
+            - string
+            - 'null'
+        metadata:
+          $ref: '#/components/schemas/EntryMetadata'
+    TransactionResponse:
+      type: object
+      required:
+        - succeeded
+        - responses
+      properties:
+        succeeded:
+          type: boolean
+        responses:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransactionOperationResponse'
+    WatchEvent:
+      type: object
+      required:
+        - op
+        - key
+        - revision
+        - timestamp
+      properties:
+        op:
+          type: string
+          enum:
+            - put
+            - delete
+            - expire
+        key:
+          type: string
+        value:
+          type:
+            - string
+            - 'null'
+        revision:
+          type: integer
+          minimum: 1
+        timestamp:
+          type: integer
+        metadata:
+          oneOf:
+            - $ref: '#/components/schemas/EntryMetadata'
+            - type: 'null'
+    CreateLeaseRequest:
+      type: object
+      required:
+        - ttl_ms
+      properties:
+        id:
+          type: string
+        ttl_ms:
+          type: integer
+          minimum: 1
+    Lease:
+      type: object
+      required:
+        - id
+        - ttl_ms
+        - expires_at
+        - created_at
+      properties:
+        id:
+          type: string
+        ttl_ms:
+          type: integer
+        expires_at:
+          type: integer
+        created_at:
+          type: integer
+    LeaseResponse:
+      type: object
+      required:
+        - ok
+        - lease
+      properties:
+        ok:
+          type: boolean
+        lease:
+          $ref: '#/components/schemas/Lease'
+    LeaseDeleteResponse:
+      type: object
+      required:
+        - ok
+        - id
+      properties:
+        ok:
+          type: boolean
+        id:
+          type: string
+    AcquireLockRequest:
+      type: object
+      required:
+        - lease_id
+      properties:
+        lease_id:
+          type: string
+        holder:
+          type: string
+    ReleaseLockRequest:
+      type: object
+      required:
+        - lease_id
+      properties:
+        lease_id:
+          type: string
+    Lock:
+      type: object
+      required:
+        - name
+        - lease_id
+        - acquired_at
+        - expires_at
+      properties:
+        name:
+          type: string
+        lease_id:
+          type: string
+        holder:
+          type:
+            - string
+            - 'null'
+        acquired_at:
+          type: integer
+        expires_at:
+          type: integer
+    LockResponse:
+      type: object
+      required:
+        - ok
+        - lock
+      properties:
+        ok:
+          type: boolean
+        lock:
+          $ref: '#/components/schemas/Lock'
+    LockDeleteResponse:
+      type: object
+      required:
+        - ok
+        - name
+      properties:
+        ok:
+          type: boolean
+        name:
+          type: string
+    ReplicationInfo:
+      type: object
+      properties:
+        snapshot_path:
+          type: string
+        snapshot_bytes:
+          type: integer
+        snapshot_checksum:
+          type:
+            - string
+            - 'null'
+        snapshot_version:
+          type: integer
+        aof_path:
+          type: string
+        aof_bytes:
+          type: integer
+        aof_version:
+          type: integer
+        revision:
+          type: integer
+      additionalProperties: true
+    ReplicationStatus:
+      type: object
+      properties:
+        leader_url:
+          type: string
+        running:
+          type: boolean
+        last_offset:
+          type: integer
+        last_error:
+          type:
+            - string
+            - 'null'
+        last_poll_at:
+          type:
+            - integer
+            - 'null'
+      additionalProperties: true
+  examples:
+    KeyValueExample:
+      summary: Stored key with metadata.
+      value:
+        key: config/theme
+        value: dark
+        metadata:
+          version: 1
+          created_at: 1782269800000
+          updated_at: 1782269800000
+          expires_at: null
+          lease_id: null
+    PutEntryRequestExample:
+      summary: Conditional put request.
+      value:
+        value: dark
+        if_absent: true
+    PutEntryResponseExample:
+      summary: Conditional put response.
+      value:
+        ok: true
+        key: config/theme
+        value: dark
+        metadata:
+          version: 1
+          created_at: 1782269800000
+          updated_at: 1782269800000
+          expires_at: null
+          lease_id: null
+    RangeExample:
+      summary: Prefix range response with values and metadata.
+      value:
+        items:
+          - key: config/theme
+            value: dark
+            metadata:
+              version: 1
+              created_at: 1782269800000
+              updated_at: 1782269800000
+              expires_at: null
+              lease_id: null
+          - key: config/title
+            value: Toska
+            metadata:
+              version: 1
+              created_at: 1782269801000
+              updated_at: 1782269801000
+              expires_at: null
+              lease_id: null
+        next_cursor: null
+    TransactionRequestExample:
+      summary: Compare version and update a key.
+      value:
+        compare:
+          - key: config/theme
+            version: 1
+        success:
+          - op: put
+            key: config/theme
+            value: light
+        failure:
+          - op: get
+            key: config/theme
+    TransactionResponseExample:
+      summary: Successful transaction.
+      value:
+        succeeded: true
+        responses:
+          - op: put
+            key: config/theme
+            value: light
+            metadata:
+              version: 2
+              created_at: 1782269800000
+              updated_at: 1782269810000
+              expires_at: null
+              lease_id: null
+    WatchEventExample:
+      summary: Watch event payload.
+      value:
+        op: put
+        key: jobs/active/worker-1
+        value: running
+        revision: 42
+        timestamp: 1782269820000
+        metadata:
+          version: 3
+          created_at: 1782269800000
+          updated_at: 1782269820000
+          expires_at: null
+          lease_id: worker-1
+    WatchStreamExample:
+      summary: Server-Sent Event frame.
+      value: |
+        id: 42
+        event: put
+        data: {"op":"put","key":"jobs/active/worker-1","value":"running","revision":42,"timestamp":1782269820000,"metadata":{"version":3,"created_at":1782269800000,"updated_at":1782269820000,"expires_at":null,"lease_id":"worker-1"}}
+    CreateLeaseRequestExample:
+      summary: Create a worker lease.
+      value:
+        id: worker-1
+        ttl_ms: 30000
+    LeaseExample:
+      summary: Active lease response.
+      value:
+        ok: true
+        lease:
+          id: worker-1
+          ttl_ms: 30000
+          created_at: 1782269800000
+          expires_at: 1782269830000
+    AcquireLockRequestExample:
+      summary: Acquire a lock with a lease.
+      value:
+        lease_id: worker-1
+        holder: worker-a
+    LockExample:
+      summary: Active lock response.
+      value:
+        ok: true
+        lock:
+          name: nightly
+          lease_id: worker-1
+          holder: worker-a
+          acquired_at: 1782269800000
+          expires_at: 1782269830000

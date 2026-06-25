@@ -129,6 +129,15 @@ This keeps the key-listing API useful as datasets grow.
 
 ### 6. OpenAPI Spec and Client SDKs
 
+Status: Complete.
+
+Implementation checkpoints:
+
+- [x] Add a maintained OpenAPI contract for the current HTTP API.
+- [x] Include examples for core KV, transactions, watches, leases, locks, and range scans.
+- [x] Add automated validation for the checked-in API contract.
+- [x] Document the initial client SDK generation plan.
+
 Add a maintained API contract:
 
 - `openapi.yaml`
@@ -197,6 +206,6 @@ For larger-than-memory datasets, evaluate an LSM-style or embedded durable backe
 
 ## Recommended Next PR
 
-Add an OpenAPI spec and initial client SDK plan.
+Implement production security improvements.
 
-The core HTTP KV, transactions, watches, leases, locks, and scalable range scans are now in place. The next highest-leverage step is publishing a maintained API contract so clients and examples can be generated consistently.
+The HTTP API now has a maintained OpenAPI contract and a client SDK plan. The next highest-leverage step is replacing the single shared token model with production-grade read, write, admin, and replication credentials.

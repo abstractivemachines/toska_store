@@ -12,6 +12,7 @@ ToskaStore is a disk-backed string KV store with a clean HTTP/JSON surface and a
 - [Testing](#testing)
 - [Server Commands](#server-commands)
 - [HTTP Endpoints](#http-endpoints)
+- [API Contract and Clients](#api-contract-and-clients)
 - [Configuration Management](#configuration-management)
 - [Development](#development)
 - [Project Structure](#project-structure)
@@ -210,9 +211,17 @@ When the server is running, the HTTP API provides a simple JSON key/value store:
 Follower mode is enabled by setting `replica_url` (or `TOSKA_REPLICA_URL`) and starting the server.
 When follower mode is enabled, KV, lease, and lock write endpoints return `403` to enforce read-only access.
 
-KV, lease, lock, stats, and replication endpoints can require an auth token and apply rate limits:
-- `auth_token` (or `TOSKA_AUTH_TOKEN`) expects `Authorization: Bearer <token>` or `X-Toska-Token`.
+KV, lease, lock, stats, and replication endpoints can require auth tokens and apply rate limits:
+- `auth_token` (or `TOSKA_AUTH_TOKEN`) protects KV, lease, lock, and stats endpoints.
+- `replication_auth_token` (or `TOSKA_REPLICATION_AUTH_TOKEN`) protects replication endpoints and falls back to `auth_token` when unset.
+- Protected endpoints expect `Authorization: Bearer <token>` or `X-Toska-Token`.
 - `rate_limit_per_sec` + `rate_limit_burst` (or `TOSKA_RATE_LIMIT_PER_SEC`, `TOSKA_RATE_LIMIT_BURST`).
+
+## API Contract and Clients
+
+The maintained OpenAPI contract is checked in at [`openapi.yaml`](../openapi.yaml). It covers the current status, KV, range, transaction, watch, lease, lock, metrics, admin, and replication endpoints. The contract is parsed in the test suite so missing paths, missing operation responses, missing workflow examples, and duplicate `operationId` values fail fast.
+
+The initial SDK generation plan is in [`docs/client-sdks.md`](client-sdks.md). The first target clients are TypeScript, Python, Go, and Elixir, with thin helpers planned for common KV operations, transactions, SSE watches, leases, locks, token auth, and typed errors.
 
 ### Key Metadata and Conditions
 
@@ -469,6 +478,7 @@ Set `TOSKA_CONFIG_DIR` to override the configuration directory used for `toska_c
 - **replica_poll_interval_ms** - Follower poll interval (default: 1000)
 - **replica_http_timeout_ms** - Follower HTTP timeout (default: 5000)
 - **auth_token** - Bearer token for protected API endpoints (default: empty)
+- **replication_auth_token** - Bearer token for replication endpoints, falling back to `auth_token` when empty (default: empty)
 - **rate_limit_per_sec** - Requests per second limit (default: 0, disabled)
 - **rate_limit_burst** - Burst capacity for rate limiting (default: 0, disabled)
 
@@ -516,6 +526,7 @@ The application respects the following environment variables:
 - `TOSKA_REPLICA_POLL_MS` - Override follower poll interval
 - `TOSKA_REPLICA_HTTP_TIMEOUT_MS` - Override follower HTTP timeout
 - `TOSKA_AUTH_TOKEN` - Require auth token for protected API endpoints
+- `TOSKA_REPLICATION_AUTH_TOKEN` - Require a separate auth token for replication endpoints
 - `TOSKA_RATE_LIMIT_PER_SEC` - Requests per second limit
 - `TOSKA_RATE_LIMIT_BURST` - Burst capacity for rate limiting
 

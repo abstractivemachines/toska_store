@@ -43,6 +43,7 @@ defmodule Toska.MixProject do
       {:jason, "~> 1.4"},
       {:bandit, "~> 1.0"},
       {:plug, "~> 1.15"},
+      {:yaml_elixir, "~> 2.12", only: :test},
       {:benchee, "~> 1.2", only: :dev, runtime: false}
     ]
   end

@@ -29,6 +29,8 @@ curl -s http://localhost:4000/kv/hello
 ## Docs
 
 - [docs/guide.md](docs/guide.md) - full install/build/config/API/CLI/development guide
+- [openapi.yaml](openapi.yaml) - maintained HTTP API contract
+- [docs/client-sdks.md](docs/client-sdks.md) - initial client SDK generation plan
 - [docs/kv-store-changes.md](docs/kv-store-changes.md) - KV store change log and milestones
 
 ## Contributing
