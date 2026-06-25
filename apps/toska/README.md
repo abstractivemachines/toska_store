@@ -166,6 +166,7 @@ toska replicate --leader http://localhost:4000 --daemon
 When the server is running, the HTTP API provides a simple JSON key/value store:
 
 - `GET /kv/:key` - Fetch a value by key
+- `GET /kv` - Range scan keys with cursor pagination (`?prefix=todo:&start=todo:1&limit=100`)
 - `GET /kv/keys` - List keys in lexicographic order (`?prefix=todo:` optional, `?limit=100` optional, max `1000`, `?cursor=...` for the next page)
 - `PUT /kv/:key` - Set a value with optional `ttl_ms` (`{"value": "...", "ttl_ms": 5000}`)
 - `DELETE /kv/:key` - Remove a key
@@ -214,6 +215,8 @@ curl -s -X PUT http://localhost:4000/kv/jobs/active/worker-1 \
 ```
 
 `POST /locks/:name/acquire` acquires a named lock with an active lease. A held lock returns `409`; release requires the owning `lease_id`.
+
+`GET /kv` returns `{"items": [...], "next_cursor": "..."}` from the ordered key index. Use `prefix` to filter, `start` as an inclusive lower-bound key, and `cursor` to continue after a page. Add `include_values=true` and `include_metadata=true` when range items should include values or metadata.
 
 `GET /kv/keys` returns `{"keys": [...], "next_cursor": "..."}`. When `next_cursor` is present, pass it back as `cursor` with the same `prefix` to fetch the next page. `limit` defaults to `100`, may be `0`, and cannot exceed `1000`.
 

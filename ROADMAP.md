@@ -107,6 +107,16 @@ This gives ToskaStore a clear lightweight-coordination use case without requirin
 
 ### 5. Scalable Prefix Range API
 
+Status: Complete.
+
+Implementation checkpoints:
+
+- [x] Add an ordered key index maintained with KV writes and deletes.
+- [x] Page prefix/range scans from the ordered index without sorting all matches.
+- [x] Expose `GET /kv` with `prefix`, `start`, `limit`, and `cursor`.
+- [x] Support optional values and metadata in range responses.
+- [x] Add regression tests and API documentation.
+
 Improve key enumeration beyond in-memory sorting:
 
 - ordered key index or ordered ETS-backed representation
@@ -187,6 +197,6 @@ For larger-than-memory datasets, evaluate an LSM-style or embedded durable backe
 
 ## Recommended Next PR
 
-Implement the scalable prefix range API.
+Add an OpenAPI spec and initial client SDK plan.
 
-Leases and locks now give ToskaStore a lightweight coordination story. The next highest-leverage step is making prefix/range reads scale beyond collecting and sorting all matching keys in memory.
+The core HTTP KV, transactions, watches, leases, locks, and scalable range scans are now in place. The next highest-leverage step is publishing a maintained API contract so clients and examples can be generated consistently.
