@@ -68,7 +68,7 @@ paths:
         - Status
       operationId: getStats
       summary: Get KV store statistics.
-      description: Requires the configured Toska API token when auth is enabled.
+      description: Requires the configured read token when read auth is enabled.
       security:
         - bearerAuth: []
         - toskaToken: []
@@ -92,6 +92,11 @@ paths:
         - Status
       operationId: getMetrics
       summary: Get Prometheus text metrics.
+      description: Requires the configured read token when read auth is enabled.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
       responses:
         '200':
           description: Prometheus text exposition format.
@@ -105,12 +110,21 @@ paths:
             text/plain:
               schema:
                 type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
   /admin/reload:
     post:
       tags:
         - Admin
       operationId: reloadConfiguration
       summary: Reload server configuration from disk and environment.
+      description: Requires the configured admin token when admin auth is enabled.
+      security:
+        - bearerAuth: []
+        - toskaToken: []
+        - {}
       responses:
         '200':
           description: Configuration was reloaded.
@@ -124,6 +138,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
   /kv:
     get:
       tags:
@@ -132,7 +150,7 @@ paths:
       summary: List keys from the ordered range index.
       description: |
         Returns a lexicographic page of keys. Values and metadata are omitted
-        unless requested. Requires the configured Toska API token when auth is
+        unless requested. Requires the configured read token when read auth is
         enabled.
       security:
         - bearerAuth: []
@@ -181,7 +199,7 @@ paths:
         - KV
       operationId: listKeys
       summary: List keys in lexicographic order.
-      description: Requires the configured Toska API token when auth is enabled.
+      description: Requires the configured read token when read auth is enabled.
       security:
         - bearerAuth: []
         - toskaToken: []
@@ -214,8 +232,8 @@ paths:
       description: |
         Streams `put`, `delete`, and `expire` events. Use `since_revision` to
         replay retained history, `once=true` to close after replay, and
-        `timeout_ms` to bound idle live streams. Requires the configured Toska
-        API token when auth is enabled.
+        `timeout_ms` to bound idle live streams. Requires the configured read
+        token when read auth is enabled.
       security:
         - bearerAuth: []
         - toskaToken: []
@@ -276,8 +294,8 @@ paths:
       summary: Atomically compare keys and apply success or failure operations.
       description: |
         Compares support `version`, `exists`, and `value`. Operations support
-        `put`, `delete`, and `get`. Requires the configured Toska API token when
-        auth is enabled. Followers reject this write with `403`.
+        `put`, `delete`, and `get`. Requires the configured write token when
+        write auth is enabled. Followers reject this write with `403`.
       security:
         - bearerAuth: []
         - toskaToken: []
@@ -317,7 +335,7 @@ paths:
         - KV
       operationId: getKey
       summary: Fetch one key.
-      description: Requires the configured Toska API token when auth is enabled.
+      description: Requires the configured read token when read auth is enabled.
       security:
         - bearerAuth: []
         - toskaToken: []
@@ -355,8 +373,9 @@ paths:
       description: |
         Writes a string value, optionally with TTL, lease ownership, and
         conditional fields. `If-Match` supplies the same version check as
-        `if_version`. `If-None-Match: *` creates only when absent. Followers
-        reject this write with `403`.
+        `if_version`. `If-None-Match: *` creates only when absent. Requires the
+        configured write token when write auth is enabled. Followers reject this
+        write with `403`.
       security:
         - bearerAuth: []
         - toskaToken: []
@@ -410,7 +429,7 @@ paths:
         - KV
       operationId: deleteKey
       summary: Delete one key.
-      description: Followers reject this write with `403`.
+      description: Requires the configured write token when write auth is enabled. Followers reject this write with `403`.
       security:
         - bearerAuth: []
         - toskaToken: []
@@ -449,7 +468,7 @@ paths:
         - KV
       operationId: getMultipleKeys
       summary: Fetch multiple keys.
-      description: Requires the configured Toska API token when auth is enabled.
+      description: Requires the configured read token when read auth is enabled.
       security:
         - bearerAuth: []
         - toskaToken: []
@@ -482,8 +501,8 @@ paths:
       operationId: createLease
       summary: Create a lease.
       description: |
-        Creates a durable TTL ownership record. Followers reject this write
-        with `403`.
+        Creates a durable TTL ownership record. Requires the configured write
+        token when write auth is enabled. Followers reject this write with `403`.
       security:
         - bearerAuth: []
         - toskaToken: []
@@ -525,7 +544,7 @@ paths:
         - Coordination
       operationId: keepaliveLease
       summary: Renew a lease.
-      description: Followers reject this write with `403`.
+      description: Requires the configured write token when write auth is enabled. Followers reject this write with `403`.
       security:
         - bearerAuth: []
         - toskaToken: []
@@ -561,8 +580,9 @@ paths:
       operationId: revokeLease
       summary: Revoke a lease.
       description: |
-        Removes attached keys and releases attached locks. Followers reject
-        this write with `403`.
+        Removes attached keys and releases attached locks. Requires the
+        configured write token when write auth is enabled. Followers reject this
+        write with `403`.
       security:
         - bearerAuth: []
         - toskaToken: []
@@ -594,7 +614,7 @@ paths:
         - Coordination
       operationId: acquireLock
       summary: Acquire a named lock with an active lease.
-      description: Followers reject this write with `403`.
+      description: Requires the configured write token when write auth is enabled. Followers reject this write with `403`.
       security:
         - bearerAuth: []
         - toskaToken: []
@@ -640,7 +660,7 @@ paths:
         - Coordination
       operationId: releaseLock
       summary: Release a named lock.
-      description: Followers reject this write with `403`.
+      description: Requires the configured write token when write auth is enabled. Followers reject this write with `403`.
       security:
         - bearerAuth: []
         - toskaToken: []
@@ -830,8 +850,10 @@ components:
       type: http
       scheme: bearer
       description: |
-        Accepted when `TOSKA_AUTH_TOKEN`, `auth_token`, or the replication token
-        is configured. Send as `Authorization: Bearer <token>`.
+        Accepted when any scoped token is configured. `read_auth_token`,
+        `write_auth_token`, `admin_auth_token`, and `replication_auth_token`
+        apply to their scopes and fall back to `auth_token` when unset. Send as
+        `Authorization: Bearer <token>`.
     toskaToken:
       type: apiKey
       in: header

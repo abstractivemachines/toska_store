@@ -11,6 +11,9 @@ defmodule Toska.RouterKVTest do
   setup do
     original_data_dir = System.get_env("TOSKA_DATA_DIR")
     original_auth_token = System.get_env("TOSKA_AUTH_TOKEN")
+    original_read_auth_token = System.get_env("TOSKA_READ_AUTH_TOKEN")
+    original_write_auth_token = System.get_env("TOSKA_WRITE_AUTH_TOKEN")
+    original_admin_auth_token = System.get_env("TOSKA_ADMIN_AUTH_TOKEN")
     original_replication_auth_token = System.get_env("TOSKA_REPLICATION_AUTH_TOKEN")
     original_rate_limit_per = System.get_env("TOSKA_RATE_LIMIT_PER_SEC")
     original_rate_limit_burst = System.get_env("TOSKA_RATE_LIMIT_BURST")
@@ -20,6 +23,9 @@ defmodule Toska.RouterKVTest do
     File.mkdir_p!(tmp_dir)
     System.put_env("TOSKA_DATA_DIR", tmp_dir)
     System.delete_env("TOSKA_AUTH_TOKEN")
+    System.delete_env("TOSKA_READ_AUTH_TOKEN")
+    System.delete_env("TOSKA_WRITE_AUTH_TOKEN")
+    System.delete_env("TOSKA_ADMIN_AUTH_TOKEN")
     System.put_env("TOSKA_REPLICATION_AUTH_TOKEN", @replication_token)
     System.delete_env("TOSKA_RATE_LIMIT_PER_SEC")
     System.delete_env("TOSKA_RATE_LIMIT_BURST")
@@ -39,6 +45,9 @@ defmodule Toska.RouterKVTest do
       end
 
       restore_env("TOSKA_AUTH_TOKEN", original_auth_token)
+      restore_env("TOSKA_READ_AUTH_TOKEN", original_read_auth_token)
+      restore_env("TOSKA_WRITE_AUTH_TOKEN", original_write_auth_token)
+      restore_env("TOSKA_ADMIN_AUTH_TOKEN", original_admin_auth_token)
       restore_env("TOSKA_REPLICATION_AUTH_TOKEN", original_replication_auth_token)
       restore_env("TOSKA_RATE_LIMIT_PER_SEC", original_rate_limit_per)
       restore_env("TOSKA_RATE_LIMIT_BURST", original_rate_limit_burst)
@@ -702,6 +711,85 @@ defmodule Toska.RouterKVTest do
       |> Toska.Router.call(@opts)
 
     assert conn.status in [200, 404]
+  end
+
+  test "scoped auth tokens separate read and write access" do
+    System.put_env("TOSKA_READ_AUTH_TOKEN", "read-secret")
+    System.put_env("TOSKA_WRITE_AUTH_TOKEN", "write-secret")
+
+    unauthorized_read_conn =
+      conn("GET", "/kv/scoped")
+      |> put_req_header("authorization", "Bearer write-secret")
+      |> Toska.Router.call(@opts)
+
+    assert unauthorized_read_conn.status == 401
+
+    authorized_read_conn =
+      conn("GET", "/kv/scoped")
+      |> put_req_header("authorization", "Bearer read-secret")
+      |> Toska.Router.call(@opts)
+
+    assert authorized_read_conn.status == 404
+
+    unauthorized_write_conn =
+      conn("PUT", "/kv/scoped", Jason.encode!(%{value: "ok"}))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("authorization", "Bearer read-secret")
+      |> Toska.Router.call(@opts)
+
+    assert unauthorized_write_conn.status == 401
+
+    authorized_write_conn =
+      conn("PUT", "/kv/scoped", Jason.encode!(%{value: "ok"}))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("authorization", "Bearer write-secret")
+      |> Toska.Router.call(@opts)
+
+    assert authorized_write_conn.status == 200
+
+    mget_conn =
+      conn("POST", "/kv/mget", Jason.encode!(%{keys: ["scoped"]}))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("authorization", "Bearer read-secret")
+      |> Toska.Router.call(@opts)
+
+    assert mget_conn.status == 200
+  end
+
+  test "admin token protects configuration reload" do
+    System.put_env("TOSKA_ADMIN_AUTH_TOKEN", "admin-secret")
+
+    unauthorized_conn =
+      conn("POST", "/admin/reload")
+      |> Toska.Router.call(@opts)
+
+    assert unauthorized_conn.status == 401
+
+    authorized_conn =
+      conn("POST", "/admin/reload")
+      |> put_req_header("authorization", "Bearer admin-secret")
+      |> Toska.Router.call(@opts)
+
+    assert authorized_conn.status == 200
+    assert Jason.decode!(authorized_conn.resp_body)["ok"] == true
+  end
+
+  test "read token protects metrics endpoint" do
+    System.put_env("TOSKA_READ_AUTH_TOKEN", "read-secret")
+
+    unauthorized_conn =
+      conn("GET", "/metrics")
+      |> Toska.Router.call(@opts)
+
+    assert unauthorized_conn.status == 401
+
+    authorized_conn =
+      conn("GET", "/metrics")
+      |> put_req_header("x-toska-token", "read-secret")
+      |> Toska.Router.call(@opts)
+
+    assert authorized_conn.status == 200
+    assert authorized_conn.resp_body =~ "toska_"
   end
 
   test "rate limiter blocks after burst is exceeded" do
