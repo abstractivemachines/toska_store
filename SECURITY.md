@@ -18,7 +18,8 @@ Security updates are provided for the latest release only.
 
 When deploying ToskaStore:
 
-- Use scoped read, write, admin, and replication authentication tokens for production deployments
+- Use scoped and named read, write, admin, and replication authentication tokens for production deployments
 - Store tokens outside of source control using environment variables
+- Review `toska_audit` logs for write and admin activity
 - Restrict network access to trusted clients only
 - Use TLS/HTTPS when exposing ToskaStore over the network

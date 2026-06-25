@@ -155,9 +155,9 @@ Implementation checkpoints:
 - [x] Add separate read, write, admin, and replication auth token configuration.
 - [x] Enforce scoped tokens across protected HTTP endpoints.
 - [x] Preserve `auth_token` as the legacy fallback when scoped tokens are unset.
-- [ ] Add named tokens for auditability.
+- [x] Add named tokens for auditability.
 - [ ] Add optional mTLS for replication and admin endpoints.
-- [ ] Add audit logging for writes and admin changes.
+- [x] Add audit logging for writes and admin changes.
 
 Move beyond one shared token:
 
@@ -219,4 +219,4 @@ For larger-than-memory datasets, evaluate an LSM-style or embedded durable backe
 
 Continue production security hardening.
 
-Scoped read, write, admin, and replication credentials are underway. The next highest-leverage step is adding named tokens and audit logging so production operators can attribute writes and admin changes.
+Scoped and named credentials are in place, and write/admin activity now emits audit logs. The next highest-leverage step is adding optional mTLS for replication and admin endpoints.

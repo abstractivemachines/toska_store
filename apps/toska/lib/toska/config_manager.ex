@@ -22,11 +22,14 @@ defmodule Toska.ConfigManager do
     "write_auth_token",
     "admin_auth_token",
     "replication_auth_token",
+    "named_auth_tokens",
     "rate_limit_per_sec",
     "rate_limit_burst",
     "replica_url",
     "max_body_size"
   ]
+  @auth_scopes ["read", "write", "admin", "replication"]
+  @named_auth_token_name_pattern ~r/^[A-Za-z0-9._:@-]+$/
   @default_sync_interval_ms 1000
   @default_snapshot_interval_ms 60_000
   @default_ttl_check_interval_ms 1000
@@ -161,6 +164,19 @@ defmodule Toska.ConfigManager do
   end
 
   @doc """
+  Get configured named auth tokens. Environment variable TOSKA_NAMED_AUTH_TOKENS
+  takes precedence and should contain a JSON array of objects with name, token,
+  and scopes.
+  """
+  def cached_named_auth_tokens do
+    case System.get_env("TOSKA_NAMED_AUTH_TOKENS") do
+      nil -> :persistent_term.get({__MODULE__, :named_auth_tokens}, [])
+      "" -> :persistent_term.get({__MODULE__, :named_auth_tokens}, [])
+      value -> normalize_named_auth_tokens(value)
+    end
+  end
+
+  @doc """
   Get the cached rate limit config. Returns {per_sec, burst}.
   Environment variables TOSKA_RATE_LIMIT_PER_SEC and TOSKA_RATE_LIMIT_BURST take precedence.
   """
@@ -280,6 +296,17 @@ defmodule Toska.ConfigManager do
     else
       token
     end
+  end
+
+  defp normalize_named_auth_tokens(value) do
+    case validate_named_auth_tokens(value) do
+      {:ok, tokens} -> tokens
+      {:error, _reason} -> invalid_named_auth_tokens()
+    end
+  end
+
+  defp invalid_named_auth_tokens do
+    [%{"name" => "invalid_named_auth_tokens", "token" => nil, "scopes" => @auth_scopes}]
   end
 
   # GenServer Callbacks
@@ -404,6 +431,11 @@ defmodule Toska.ConfigManager do
     :persistent_term.put(
       {__MODULE__, :replication_auth_token},
       config["replication_auth_token"] || ""
+    )
+
+    :persistent_term.put(
+      {__MODULE__, :named_auth_tokens},
+      normalize_named_auth_tokens(config["named_auth_tokens"] || [])
     )
 
     :persistent_term.put(
@@ -541,6 +573,9 @@ defmodule Toska.ConfigManager do
       "replication_auth_token" ->
         validate_optional_string(value)
 
+      "named_auth_tokens" ->
+        validate_named_auth_tokens(value)
+
       "rate_limit_per_sec" ->
         validate_nonnegative_int(value)
 
@@ -614,6 +649,100 @@ defmodule Toska.ConfigManager do
   defp validate_optional_string(nil), do: {:ok, nil}
   defp validate_optional_string(_), do: {:error, "Value must be a string or empty"}
 
+  defp validate_named_auth_tokens(value) when is_binary(value) do
+    case Jason.decode(value) do
+      {:ok, decoded} -> validate_named_auth_tokens(decoded)
+      {:error, _reason} -> {:error, "Named auth tokens must be a JSON array"}
+    end
+  end
+
+  defp validate_named_auth_tokens(value) when is_list(value) do
+    value
+    |> Enum.reduce_while({:ok, []}, fn token, {:ok, tokens} ->
+      case validate_named_auth_token(token) do
+        {:ok, normalized} -> {:cont, {:ok, [normalized | tokens]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, tokens} -> {:ok, Enum.reverse(tokens)}
+      error -> error
+    end
+  end
+
+  defp validate_named_auth_tokens(_), do: {:error, "Named auth tokens must be a list"}
+
+  defp validate_named_auth_token(token) when is_map(token) do
+    name = string_key(token, "name")
+    secret = string_key(token, "token")
+    scopes = map_key(token, "scopes")
+
+    cond do
+      not valid_named_auth_token_name?(name) ->
+        {:error,
+         "Named auth token name must use letters, numbers, dot, underscore, colon, at, or dash"}
+
+      not non_empty_string?(secret) ->
+        {:error, "Named auth token token must be a non-empty string"}
+
+      not is_list(scopes) or scopes == [] ->
+        {:error, "Named auth token scopes must be a non-empty list"}
+
+      true ->
+        normalize_named_token_scopes(scopes)
+        |> case do
+          {:ok, normalized_scopes} ->
+            {:ok, %{"name" => name, "token" => secret, "scopes" => normalized_scopes}}
+
+          error ->
+            error
+        end
+    end
+  end
+
+  defp validate_named_auth_token(_), do: {:error, "Named auth token must be an object"}
+
+  defp normalize_named_token_scopes(scopes) do
+    normalized =
+      scopes
+      |> Enum.map(&normalize_named_token_scope/1)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+
+    if length(normalized) == length(Enum.uniq(scopes)) and normalized != [] do
+      {:ok, normalized}
+    else
+      {:error, "Named auth token scopes must be read, write, admin, or replication"}
+    end
+  end
+
+  defp normalize_named_token_scope(scope) when scope in @auth_scopes, do: scope
+
+  defp normalize_named_token_scope(scope) when is_atom(scope) do
+    scope
+    |> Atom.to_string()
+    |> normalize_named_token_scope()
+  end
+
+  defp normalize_named_token_scope(_scope), do: nil
+
+  defp non_empty_string?(value), do: is_binary(value) and byte_size(value) > 0
+
+  defp valid_named_auth_token_name?(value) do
+    non_empty_string?(value) and String.match?(value, @named_auth_token_name_pattern)
+  end
+
+  defp string_key(map, key) do
+    value = map_key(map, key)
+    if is_binary(value), do: value, else: nil
+  end
+
+  defp map_key(map, key) do
+    Map.get(map, key) || Map.get(map, String.to_existing_atom(key))
+  rescue
+    ArgumentError -> Map.get(map, key)
+  end
+
   defp validate_nonnegative_int(value) when is_integer(value) and value >= 0, do: {:ok, value}
 
   defp validate_nonnegative_int(value) when is_binary(value) do
@@ -661,6 +790,7 @@ defmodule Toska.ConfigManager do
       "write_auth_token" => "",
       "admin_auth_token" => "",
       "replication_auth_token" => "",
+      "named_auth_tokens" => [],
       "rate_limit_per_sec" => 0,
       "rate_limit_burst" => 0,
       # TLS configuration

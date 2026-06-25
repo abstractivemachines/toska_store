@@ -92,6 +92,7 @@ defmodule Toska.Commands.Config do
       write_auth_token Bearer token for write endpoints (empty uses auth_token)
       admin_auth_token Bearer token for admin endpoints (empty uses auth_token)
       replication_auth_token Bearer token for replication endpoints (empty uses auth_token)
+      named_auth_tokens JSON array of named token objects with name, token, and scopes; names may use letters, numbers, . _ : @ -
       rate_limit_per_sec Requests per second rate limit (0 disables)
       rate_limit_burst Burst capacity for rate limiting (0 disables)
     """)
