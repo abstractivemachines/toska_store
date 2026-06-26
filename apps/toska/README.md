@@ -194,9 +194,12 @@ KV, lease, lock, stats, metrics, admin, and replication endpoints can require sc
 - `write_auth_token` (or `TOSKA_WRITE_AUTH_TOKEN`) protects KV write, transaction, lease, and lock endpoints.
 - `admin_auth_token` (or `TOSKA_ADMIN_AUTH_TOKEN`) protects admin endpoints.
 - `replication_auth_token` (or `TOSKA_REPLICATION_AUTH_TOKEN`) protects replication endpoints.
+- `named_auth_tokens` (or `TOSKA_NAMED_AUTH_TOKENS`) accepts a JSON array of named tokens with `name`, `token`, and `scopes` fields. Valid scopes are `read`, `write`, `admin`, and `replication`; names may use letters, numbers, `.`, `_`, `:`, `@`, and `-`.
 - Scoped tokens fall back to `auth_token` (or `TOSKA_AUTH_TOKEN`) when unset.
 - Protected endpoints expect `Authorization: Bearer <token>` or `X-Toska-Token`.
 - `rate_limit_per_sec` + `rate_limit_burst` (or `TOSKA_RATE_LIMIT_PER_SEC`, `TOSKA_RATE_LIMIT_BURST`).
+
+Write and admin requests emit `toska_audit` log entries with the matched token name when a named token is used.
 
 `GET /kv/:key` returns `value` plus metadata (`version`, `created_at`, `updated_at`, `expires_at`, `lease_id`) and sets an `ETag` matching the current version.
 `PUT /kv/:key` accepts optional `if_version`, `if_absent`, and `if_present` fields. `DELETE /kv/:key` accepts `if_version` as a query parameter. `PUT` and `DELETE` also accept `If-Match: "<version>"`; failed conditions return `412`.
@@ -255,6 +258,7 @@ Set `TOSKA_DATA_DIR` to override the data directory for AOF/snapshot files.
 - **write_auth_token** (string): Bearer token for write endpoints, falling back to `auth_token` when empty (default: empty)
 - **admin_auth_token** (string): Bearer token for admin endpoints, falling back to `auth_token` when empty (default: empty)
 - **replication_auth_token** (string): Bearer token for replication endpoints, falling back to `auth_token` when empty (default: empty)
+- **named_auth_tokens** (array): Named token objects with `name`, `token`, and `scopes` fields for audit attribution. Names may use letters, numbers, `.`, `_`, `:`, `@`, and `-` (default: empty)
 - **rate_limit_per_sec** (integer): Requests per second limit (default: 0, disabled)
 - **rate_limit_burst** (integer): Burst capacity for rate limiting (default: 0, disabled)
 

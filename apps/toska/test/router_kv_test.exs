@@ -1,5 +1,6 @@
 defmodule Toska.RouterKVTest do
   use ExUnit.Case, async: false
+  import ExUnit.CaptureLog
   import Plug.Test
   import Plug.Conn
 
@@ -15,6 +16,7 @@ defmodule Toska.RouterKVTest do
     original_write_auth_token = System.get_env("TOSKA_WRITE_AUTH_TOKEN")
     original_admin_auth_token = System.get_env("TOSKA_ADMIN_AUTH_TOKEN")
     original_replication_auth_token = System.get_env("TOSKA_REPLICATION_AUTH_TOKEN")
+    original_named_auth_tokens = System.get_env("TOSKA_NAMED_AUTH_TOKENS")
     original_rate_limit_per = System.get_env("TOSKA_RATE_LIMIT_PER_SEC")
     original_rate_limit_burst = System.get_env("TOSKA_RATE_LIMIT_BURST")
     original_replica_url = System.get_env("TOSKA_REPLICA_URL")
@@ -27,6 +29,7 @@ defmodule Toska.RouterKVTest do
     System.delete_env("TOSKA_WRITE_AUTH_TOKEN")
     System.delete_env("TOSKA_ADMIN_AUTH_TOKEN")
     System.put_env("TOSKA_REPLICATION_AUTH_TOKEN", @replication_token)
+    System.delete_env("TOSKA_NAMED_AUTH_TOKENS")
     System.delete_env("TOSKA_RATE_LIMIT_PER_SEC")
     System.delete_env("TOSKA_RATE_LIMIT_BURST")
     System.delete_env("TOSKA_REPLICA_URL")
@@ -49,6 +52,7 @@ defmodule Toska.RouterKVTest do
       restore_env("TOSKA_WRITE_AUTH_TOKEN", original_write_auth_token)
       restore_env("TOSKA_ADMIN_AUTH_TOKEN", original_admin_auth_token)
       restore_env("TOSKA_REPLICATION_AUTH_TOKEN", original_replication_auth_token)
+      restore_env("TOSKA_NAMED_AUTH_TOKENS", original_named_auth_tokens)
       restore_env("TOSKA_RATE_LIMIT_PER_SEC", original_rate_limit_per)
       restore_env("TOSKA_RATE_LIMIT_BURST", original_rate_limit_burst)
       restore_env("TOSKA_REPLICA_URL", original_replica_url)
@@ -756,6 +760,58 @@ defmodule Toska.RouterKVTest do
     assert mget_conn.status == 200
   end
 
+  test "named auth tokens authorize by scope and identify write audit logs" do
+    System.put_env(
+      "TOSKA_NAMED_AUTH_TOKENS",
+      Jason.encode!([
+        %{name: "reader", token: "read-secret", scopes: ["read"]},
+        %{name: "deployer", token: "write-secret", scopes: ["write"]}
+      ])
+    )
+
+    unauthorized_read_conn =
+      conn("GET", "/kv/named-audit")
+      |> put_req_header("authorization", "Bearer write-secret")
+      |> Toska.Router.call(@opts)
+
+    assert unauthorized_read_conn.status == 401
+
+    log =
+      capture_log(fn ->
+        conn =
+          conn("PUT", "/kv/named-audit", Jason.encode!(%{value: "ok"}))
+          |> put_req_header("content-type", "application/json")
+          |> put_req_header("authorization", "Bearer write-secret")
+          |> Toska.Router.call(@opts)
+
+        assert conn.status == 200
+      end)
+
+    assert log =~ "toska_audit"
+    assert log =~ "scope=write"
+    assert log =~ "token=deployer"
+    assert log =~ "method=PUT"
+    assert log =~ "path=/kv/named-audit"
+    assert log =~ "status=200"
+
+    read_conn =
+      conn("GET", "/kv/named-audit")
+      |> put_req_header("authorization", "Bearer read-secret")
+      |> Toska.Router.call(@opts)
+
+    assert read_conn.status == 200
+  end
+
+  test "invalid named auth token environment fails closed" do
+    System.put_env("TOSKA_NAMED_AUTH_TOKENS", "not-json")
+
+    conn =
+      conn("GET", "/kv/invalid-named-config")
+      |> Toska.Router.call(@opts)
+
+    assert conn.status == 401
+  end
+
   test "admin token protects configuration reload" do
     System.put_env("TOSKA_ADMIN_AUTH_TOKEN", "admin-secret")
 
@@ -772,6 +828,30 @@ defmodule Toska.RouterKVTest do
 
     assert authorized_conn.status == 200
     assert Jason.decode!(authorized_conn.resp_body)["ok"] == true
+  end
+
+  test "named admin token identifies admin audit logs" do
+    System.put_env(
+      "TOSKA_NAMED_AUTH_TOKENS",
+      Jason.encode!([%{name: "operator", token: "admin-secret", scopes: ["admin"]}])
+    )
+
+    log =
+      capture_log(fn ->
+        conn =
+          conn("POST", "/admin/reload")
+          |> put_req_header("authorization", "Bearer admin-secret")
+          |> Toska.Router.call(@opts)
+
+        assert conn.status == 200
+      end)
+
+    assert log =~ "toska_audit"
+    assert log =~ "scope=admin"
+    assert log =~ "token=operator"
+    assert log =~ "method=POST"
+    assert log =~ "path=/admin/reload"
+    assert log =~ "status=200"
   end
 
   test "read token protects metrics endpoint" do

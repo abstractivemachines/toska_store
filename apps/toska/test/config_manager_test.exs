@@ -75,6 +75,19 @@ defmodule Toska.ConfigManagerTest do
     assert {:error, _} = Toska.ConfigManager.set("env", "stage")
     assert {:error, _} = Toska.ConfigManager.set("log_level", "verbose")
     assert {:error, _} = Toska.ConfigManager.set("host", "")
+    assert {:error, _} = Toska.ConfigManager.set("named_auth_tokens", "not-json")
+
+    assert {:error, _} =
+             Toska.ConfigManager.set(
+               "named_auth_tokens",
+               Jason.encode!([%{name: "bad", token: "secret", scopes: ["unknown"]}])
+             )
+
+    assert {:error, _} =
+             Toska.ConfigManager.set(
+               "named_auth_tokens",
+               Jason.encode!([%{name: "bad name", token: "secret", scopes: ["read"]}])
+             )
   end
 
   test "accepts unknown keys" do
@@ -106,6 +119,20 @@ defmodule Toska.ConfigManagerTest do
     assert :ok = Toska.ConfigManager.set("write_auth_token", "write-token")
     assert :ok = Toska.ConfigManager.set("admin_auth_token", "admin-token")
     assert :ok = Toska.ConfigManager.set("replication_auth_token", "repl-token")
+
+    assert :ok =
+             Toska.ConfigManager.set(
+               "named_auth_tokens",
+               Jason.encode!([
+                 %{name: "ci", token: "ci-token", scopes: ["read", "write"]},
+                 %{name: "ops", token: "ops-token", scopes: ["admin"]}
+               ])
+             )
+
+    assert {:ok, named_tokens} = Toska.ConfigManager.get("named_auth_tokens")
+    assert Enum.map(named_tokens, & &1["name"]) == ["ci", "ops"]
+    assert Enum.flat_map(named_tokens, & &1["scopes"]) == ["read", "write", "admin"]
+
     assert :ok = Toska.ConfigManager.set("rate_limit_per_sec", "0")
     assert :ok = Toska.ConfigManager.set("rate_limit_burst", 2)
   end

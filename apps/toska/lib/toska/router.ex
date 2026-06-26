@@ -6,6 +6,7 @@ defmodule Toska.Router do
   """
 
   use Plug.Router
+  require Logger
 
   alias Toska.ConfigManager
   alias Toska.RateLimiter
@@ -985,6 +986,7 @@ defmodule Toska.Router do
       scope ->
         conn
         |> ensure_auth(scope)
+        |> register_audit(scope)
         |> ensure_rate_limit()
         |> ensure_read_only()
     end
@@ -993,24 +995,113 @@ defmodule Toska.Router do
   defp ensure_auth(%Plug.Conn{halted: true} = conn, _scope), do: conn
 
   defp ensure_auth(conn, scope) do
-    token = auth_token(scope)
-
-    if token == "" do
-      conn
-    else
-      header = get_req_header(conn, "authorization") |> List.first()
-      alt_header = get_req_header(conn, "x-toska-token") |> List.first()
-
-      if token_match?(token, header) or token_match?(token, alt_header) do
+    case authorize_request(conn, scope) do
+      {:ok, nil} ->
         conn
-      else
+
+      {:ok, identity} ->
+        assign(conn, :toska_auth, identity)
+
+      :error ->
         conn
         |> put_resp_content_type("application/json")
         |> send_resp(401, Jason.encode!(%{error: "Unauthorized"}))
         |> halt()
-      end
     end
   end
+
+  defp authorize_request(conn, scope) do
+    configured_tokens = configured_tokens(scope)
+
+    if configured_tokens == [] do
+      {:ok, nil}
+    else
+      conn
+      |> request_tokens()
+      |> Enum.find_value(:error, fn presented_token ->
+        case match_token(configured_tokens, presented_token) do
+          nil -> false
+          identity -> {:ok, identity}
+        end
+      end)
+    end
+  end
+
+  defp configured_tokens(scope) do
+    named =
+      scope
+      |> named_auth_tokens()
+      |> Enum.map(fn token ->
+        %{
+          type: :named,
+          name: Map.fetch!(token, "name"),
+          token: Map.fetch!(token, "token"),
+          scope: scope
+        }
+      end)
+
+    case auth_token(scope) do
+      "" ->
+        named
+
+      token ->
+        named ++ [%{type: :legacy, name: "legacy:#{scope}", token: token, scope: scope}]
+    end
+  end
+
+  defp named_auth_tokens(scope) do
+    scope_name = Atom.to_string(scope)
+
+    ConfigManager.cached_named_auth_tokens()
+    |> Enum.filter(fn token -> scope_name in Map.get(token, "scopes", []) end)
+  end
+
+  defp request_tokens(conn) do
+    authorization =
+      conn
+      |> get_req_header("authorization")
+      |> List.first()
+      |> normalize_authorization_header()
+
+    alt_header =
+      conn
+      |> get_req_header("x-toska-token")
+      |> List.first()
+
+    [authorization, alt_header]
+    |> Enum.filter(&non_empty_string?/1)
+    |> Enum.uniq()
+  end
+
+  defp normalize_authorization_header(nil), do: nil
+
+  defp normalize_authorization_header("Bearer " <> token), do: token
+  defp normalize_authorization_header(header), do: header
+
+  defp match_token(configured_tokens, presented_token) do
+    Enum.find(configured_tokens, fn configured ->
+      token_match?(configured.token, presented_token)
+    end)
+  end
+
+  defp register_audit(%Plug.Conn{halted: true} = conn, _scope), do: conn
+
+  defp register_audit(conn, scope) when scope in [:write, :admin] do
+    register_before_send(conn, fn conn ->
+      auth = conn.assigns[:toska_auth]
+
+      Logger.info(
+        "toska_audit scope=#{scope} token=#{audit_token_name(auth)} method=#{conn.method} path=#{conn.request_path} status=#{conn.status} client=#{client_key(conn)}"
+      )
+
+      conn
+    end)
+  end
+
+  defp register_audit(conn, _scope), do: conn
+
+  defp audit_token_name(nil), do: "none"
+  defp audit_token_name(%{name: name}), do: name
 
   defp ensure_rate_limit(%Plug.Conn{halted: true} = conn), do: conn
 
@@ -1086,11 +1177,15 @@ defmodule Toska.Router do
 
   defp token_match?(_token, nil), do: false
 
-  defp token_match?(token, header) when is_binary(header) do
-    header == token or header == "Bearer #{token}"
+  defp token_match?(token, presented_token)
+       when is_binary(token) and is_binary(presented_token) do
+    byte_size(token) == byte_size(presented_token) and
+      Plug.Crypto.secure_compare(token, presented_token)
   end
 
   defp token_match?(_token, _header), do: false
+
+  defp non_empty_string?(value), do: is_binary(value) and byte_size(value) > 0
 
   defp rate_limit_config do
     ConfigManager.cached_rate_limit()

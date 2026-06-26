@@ -852,8 +852,10 @@ components:
       description: |
         Accepted when any scoped token is configured. `read_auth_token`,
         `write_auth_token`, `admin_auth_token`, and `replication_auth_token`
-        apply to their scopes and fall back to `auth_token` when unset. Send as
-        `Authorization: Bearer <token>`.
+        apply to their scopes and fall back to `auth_token` when unset.
+        `named_auth_tokens` entries can authorize one or more scopes and appear
+        in write/admin audit logs by name; names may use letters, numbers,
+        `.`, `_`, `:`, `@`, and `-`. Send as `Authorization: Bearer <token>`.
     toskaToken:
       type: apiKey
       in: header
